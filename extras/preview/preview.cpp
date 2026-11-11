@@ -16,14 +16,15 @@ int main(int argc, char **argv) {
   if (taps.empty()) taps.push_back(2000);
 
   AnimConfig c;
-  c.idleBg = 0x000000; c.idleBall = 0xFFFFFF; c.tapBg = 0xF4F4F4; c.tapBall = 0x0B0B0E;
-  c.ballRadius = 165; c.homeYaw = 28; c.homePitch = 27; c.homeRoll = -10;
-  c.wander = 10; c.drift = 12; c.wipeMs = 550; c.autoReturnMs = 0;
+  // keep in sync with the settings at the top of RoboEyes.ino
+  c.idleFace = 0xFFFFFF; c.idleEyes = 0x000000; c.tapFace = 0x0B0B0E; c.tapEyes = 0xF4F4F4;
+  c.faceRadius = 236; c.homeYaw = 28; c.homePitch = 27; c.homeRoll = -10;
+  c.wander = 10; c.drift = 4; c.wipeMs = 550; c.autoReturnMs = 0;
   c.eye = { 0.25f, 0.0f, 0.10f, 0.11f, 0.0f }; c.screenSize = N;
   Animator a; a.begin(c, 12345, 1);
 
   std::vector<uint16_t> frame(N * N);
-  std::vector<unsigned char> sheet(COLS * T * ROWS * T * 3, 30);
+  std::vector<unsigned char> sheet(COLS * T * ROWS * T * 3, 110);
   Xform xf = makeXform(0, N);
   int tile = 0;
   for (uint32_t t = 1; tile < COLS * ROWS; t += 10) {     // simulate at 100 fps
@@ -43,7 +44,7 @@ int main(int argc, char **argv) {
         float dx = x + 0.5f - T / 2.f, dy = y + 0.5f - T / 2.f;
         bool in = dx * dx + dy * dy <= (T / 2.f) * (T / 2.f);
         unsigned char *o = &sheet[((oy + y) * COLS * T + ox + x) * 3];
-        o[0] = in ? r / (S * S) : 70; o[1] = in ? g / (S * S) : 70; o[2] = in ? b / (S * S) : 70;
+        o[0] = in ? r / (S * S) : 110; o[1] = in ? g / (S * S) : 110; o[2] = in ? b / (S * S) : 110;
       }
       tile++;
     }

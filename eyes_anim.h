@@ -9,13 +9,14 @@ namespace eyes {
 
 static const float DEG = 3.14159265f / 180.f;
 
+// The whole round screen is the ball's face; only the eyes are drawn on it.
 struct AnimConfig {
-  uint32_t idleBg, idleBall;        // colors before tapping
-  uint32_t tapBg, tapBall;          // colors after tapping
-  float ballRadius;                 // px
+  uint32_t idleFace, idleEyes;      // colors before tapping
+  uint32_t tapFace, tapEyes;        // colors after tapping
+  float faceRadius;                 // px; slightly larger than the screen radius
   float homeYaw, homePitch, homeRoll;   // degrees: resting gaze (from the reference art)
-  float wander;                     // degrees of subtle gaze wander around home
-  float drift;                      // px of gentle floating
+  float wander;                     // degrees of gaze wander around home (new target every few s)
+  float drift;                      // degrees of slow, continuous floating on top of that
   uint32_t wipeMs;                  // how long the color inversion takes
   uint32_t autoReturnMs;            // 0 = tap toggles, else revert after this long
   EyeStyle eye;
@@ -39,8 +40,7 @@ class Animator {
   void begin(const AnimConfig &cfg, uint32_t seed, uint32_t now) {
     c = cfg;
     rng = seed ? seed : 0x9E3779B9u;
-    float half = c.screenSize * 0.5f;
-    bx.x = half; by.x = half; br.x = c.ballRadius;
+    br.x = c.faceRadius;
     yaw.x = c.homeYaw * DEG; pitch.x = c.homePitch * DEG; roll.x = c.homeRoll * DEG;
     tYaw = yaw.x; tPitch = pitch.x; tRoll = roll.x;
     inverted = false;
@@ -91,15 +91,12 @@ class Animator {
     pitch.step(tPitch, omega, dt);
     roll.step(tRoll, omega * 0.8f, dt);
 
-    // ---- ball position: gentle float + lean toward where it's looking ----
-    float half = c.screenSize * 0.5f;
-    float fx = c.drift * (sinf(t * 0.63f + 0.7f) * 0.7f + sinf(t * 1.17f) * 0.3f);
-    float fy = c.drift * (sinf(t * 0.51f) * 0.6f + sinf(t * 0.93f + 2.1f) * 0.4f);
-    float leanX = (yaw.x - c.homeYaw * DEG) * 22.f;
-    float leanY = -(pitch.x - c.homePitch * DEG) * 22.f;
-    bx.step(half + fx + leanX, 6.f, dt);
-    by.step(half + fy + leanY, 6.f, dt);
-    br.step(c.ballRadius, 10.f, dt);
+    // ---- slow continuous float, so the eyes never sit perfectly still ----
+    float fx = c.drift * DEG * (sinf(t * 0.63f + 0.7f) * 0.7f + sinf(t * 1.17f) * 0.3f);
+    float fy = c.drift * DEG * (sinf(t * 0.51f) * 0.6f + sinf(t * 0.93f + 2.1f) * 0.4f);
+    // face radius only ever bulges outward (tap "boing"), so the rim never shows
+    br.step(c.faceRadius, 10.f, dt);
+    if (br.x < c.faceRadius) { br.x = c.faceRadius; if (br.v < 0) br.v = 0; }
 
     // ---- blinking (both eyes together) ----
     if (blinkStart == 0 && (int32_t)(now - nextBlink) >= 0) startBlink(now, true);
@@ -130,8 +127,9 @@ class Animator {
     }
 
     // ---- fill the scene ----
-    s.ballX = bx.x; s.ballY = by.x; s.ballR = br.x;
-    s.yaw = yaw.x; s.pitch = pitch.x; s.roll = roll.x;
+    float half = c.screenSize * 0.5f;
+    s.ballX = half; s.ballY = half; s.ballR = br.x;
+    s.yaw = yaw.x + fx; s.pitch = pitch.x + fy; s.roll = roll.x;
     s.blink = open;
     bool baseInv = inverted;
     setPalette(baseInv, s.bgA, s.fgA);
@@ -148,7 +146,7 @@ class Animator {
  private:
   AnimConfig c;
   Scene s;
-  Spring bx, by, br, yaw, pitch, roll;
+  Spring br, yaw, pitch, roll;
   float tYaw, tPitch, tRoll;
   bool inverted, wiping, wipeToInverted, justFinishedWipe;
   uint32_t wipeStart, tapTime = 0;
@@ -165,9 +163,10 @@ class Animator {
   float frand(float lo, float hi) { return lo + (hi - lo) * (next() % 10001) / 10000.f; }
   static float ease(float x) { return x * x * (3.f - 2.f * x); }
 
+  // renderer terms: fg = the ball (the face), bg = what shows through the eye holes
   void setPalette(bool inv, Color &bg, Color &fg) const {
-    bg = hexColor(inv ? c.tapBg : c.idleBg);
-    fg = hexColor(inv ? c.tapBall : c.idleBall);
+    bg = hexColor(inv ? c.tapEyes : c.idleEyes);
+    fg = hexColor(inv ? c.tapFace : c.idleFace);
   }
 
   void goHome() { tYaw = c.homeYaw * DEG; tPitch = c.homePitch * DEG; tRoll = c.homeRoll * DEG; }
@@ -198,8 +197,8 @@ class Animator {
     wipeToInverted = !inverted;
     wiping = true;
     wipeStart = now;
-    // wipe grows from the ball's center until it covers the farthest screen corner
-    wipeX = bx.x; wipeY = by.x;
+    // wipe grows from the screen center until it covers the farthest corner
+    wipeX = wipeY = c.screenSize * 0.5f;
     float W = (float)c.screenSize, mx = 0;
     const float cx[4] = { 0, W, 0, W }, cy[4] = { 0, 0, W, W };
     for (int i = 0; i < 4; i++) {
@@ -209,7 +208,7 @@ class Animator {
     wipeMaxR = mx + 2.f;
     // look around, with a little "boing"
     lookStep = 0; lookStepStart = now;
-    br.v += 260.f;
+    br.v += 300.f;
     blinkStart = 0; blinksLeft = 0;
     nextBlink = now + 4000;   // the look-around ends with its own blink
   }

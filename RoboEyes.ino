@@ -1,12 +1,14 @@
 /*
- * RoboEyes - a ball character with two pill-shaped eyes for the
- * Waveshare ESP32-S3-Touch-AMOLED-1.43 (466x466 round AMOLED, FT3168 touch).
+ * RoboEyes - two pill-shaped eyes for the Waveshare ESP32-S3-Touch-AMOLED-1.43
+ * (466x466 round AMOLED, FT3168 touch).
  *
- * - Idle: white ball on a black background. The eyes are cut-outs, blink
- *   together, and the ball drifts and glances around.
- * - Tap: the ball looks around and the screen inverts with a circular wipe
- *   (white background, black ball).
- * - Tap again: back to black. (Or set AUTO_RETURN_MS to revert by itself.)
+ * The round screen itself is the character's face: it's rendered as a 3D ball
+ * exactly the size of the display, so only the eyes are drawn on it.
+ *
+ * - Idle: white face, black eyes. Both eyes blink together and glide around.
+ * - Tap: the eyes look around and the face inverts with a circular wipe
+ *   (black face, white eyes).
+ * - Tap again: back to white. (Or set AUTO_RETURN_MS to revert by itself.)
  *
  * Arduino IDE settings (Tools menu):
  *   Board:            ESP32S3 Dev Module
@@ -33,20 +35,23 @@
 // =====================================================================
 
 // Colors as 0xRRGGBB
-#define IDLE_BACKGROUND   0x000000   // before tapping: black screen...
-#define IDLE_BALL         0xFFFFFF   // ...white ball
-#define TAP_BACKGROUND    0xF4F4F4   // after tapping: white screen...
-#define TAP_BALL          0x0B0B0E   // ...black ball
+#define IDLE_FACE         0xFFFFFF   // before tapping: white screen...
+#define IDLE_EYES         0x000000   // ...black eyes
+#define TAP_FACE          0x0B0B0E   // after tapping: black screen...
+#define TAP_EYES          0xF4F4F4   // ...white eyes
 
-#define BALL_RADIUS       165        // px (screen is 466 px wide)
+// Size of the 3D ball the eyes sit on. 236 = just past the 233 px screen
+// radius, so the ball's edge is the screen's edge. Bigger = bigger eyes that
+// move further across the screen.
+#define FACE_RADIUS       236
 
 // Resting gaze, matched to the reference images (looking up and to the right)
 #define HOME_YAW          28         // degrees, + = right
 #define HOME_PITCH        27         // degrees, + = up
 #define HOME_ROLL         -10        // degrees, + = clockwise tilt
 
-#define GAZE_WANDER       10         // degrees the gaze drifts around while idle
-#define BALL_DRIFT        12         // px the ball floats around while idle
+#define GAZE_WANDER       10         // degrees the gaze wanders around while idle
+#define GAZE_DRIFT        4          // degrees of slow continuous floating
 #define WIPE_MS           550        // speed of the black/white inversion
 #define AUTO_RETURN_MS    0          // 0 = tap toggles; else go back to black after N ms
 
@@ -202,11 +207,10 @@ static bool isTouched() {
 static eyes::Animator anim;
 static eyes::Xform xform;
 
-// Physical bounding box of the ball (with a margin), honoring SCREEN_ROTATION.
-static eyes::Rect ballRect(const eyes::Scene &s) {
-  float W = LCD_SIZE, m = 3;
-  float lx0 = s.ballX - s.ballR - m, lx1 = s.ballX + s.ballR + m;
-  float ly0 = s.ballY - s.ballR - m, ly1 = s.ballY + s.ballR + m;
+// Logical rect -> physical rect, honoring SCREEN_ROTATION.
+static eyes::Rect toPhysical(eyes::Rect l) {
+  float W = LCD_SIZE;
+  float lx0 = l.x0, lx1 = l.x1 + 1, ly0 = l.y0, ly1 = l.y1 + 1;
   float ax, ay, bx, by;   // logical -> physical for two opposite corners
   switch (SCREEN_ROTATION) {
     case 90:  ax = W - ly0; ay = lx0; bx = W - ly1; by = lx1; break;
@@ -215,20 +219,28 @@ static eyes::Rect ballRect(const eyes::Scene &s) {
     default:  ax = lx0; ay = ly0; bx = lx1; by = ly1; break;
   }
   return { (int)floorf(fminf(ax, bx)), (int)floorf(fminf(ay, by)),
-           (int)ceilf(fmaxf(ax, bx)), (int)ceilf(fmaxf(ay, by)) };
+           (int)ceilf(fmaxf(ax, bx)) - 1, (int)ceilf(fmaxf(ay, by)) - 1 };
+}
+
+static bool isEmpty(const eyes::Rect &r) { return r.x1 < r.x0 || r.y1 < r.y0; }
+
+static eyes::Rect unite(const eyes::Rect &a, const eyes::Rect &b) {
+  if (isEmpty(a)) return b;
+  if (isEmpty(b)) return a;
+  return { min(a.x0, b.x0), min(a.y0, b.y0), max(a.x1, b.x1), max(a.y1, b.y1) };
 }
 
 // Render and send a rectangle in strips, double-buffered over DMA.
-static void pushRect(const eyes::Scene &s, eyes::Rect r) {
+static void pushRect(const eyes::Scene &s, const eyes::Prepared &p, eyes::Rect r) {
+  if (isEmpty(r)) return;
   // panel needs even start and odd end coordinates
   r.x0 = max(r.x0, 0) & ~1;
   r.y0 = max(r.y0, 0) & ~1;
   r.x1 = min(r.x1 | 1, LCD_SIZE - 1);
   r.y1 = min(r.y1 | 1, LCD_SIZE - 1);
+  if (isEmpty(r)) return;
   int w = r.x1 - r.x0 + 1;
 
-  eyes::Prepared p;
-  eyes::prepare(s, p);
   static int which = 0;
   for (int y = r.y0; y <= r.y1; y += STRIP_ROWS) {
     int rows = min(STRIP_ROWS, r.y1 - y + 1);
@@ -242,7 +254,7 @@ static void pushRect(const eyes::Scene &s, eyes::Rect r) {
 // =====================================================================
 //  Arduino entry points
 // =====================================================================
-static eyes::Rect prevRect;
+static eyes::Rect prevRect = { 0, 0, -1, -1 };
 static bool firstFrame = true;
 
 void setup() {
@@ -253,12 +265,12 @@ void setup() {
   setBrightness(BRIGHTNESS);
 
   eyes::AnimConfig cfg;
-  cfg.idleBg = IDLE_BACKGROUND;  cfg.idleBall = IDLE_BALL;
-  cfg.tapBg = TAP_BACKGROUND;    cfg.tapBall = TAP_BALL;
-  cfg.ballRadius = BALL_RADIUS;
+  cfg.idleFace = IDLE_FACE;  cfg.idleEyes = IDLE_EYES;
+  cfg.tapFace = TAP_FACE;    cfg.tapEyes = TAP_EYES;
+  cfg.faceRadius = FACE_RADIUS;
   cfg.homeYaw = HOME_YAW; cfg.homePitch = HOME_PITCH; cfg.homeRoll = HOME_ROLL;
   cfg.wander = GAZE_WANDER;
-  cfg.drift = BALL_DRIFT;
+  cfg.drift = GAZE_DRIFT;
   cfg.wipeMs = WIPE_MS;
   cfg.autoReturnMs = AUTO_RETURN_MS;
   cfg.eye.spacing = EYE_SPACING;
@@ -285,16 +297,19 @@ void loop() {
   anim.update(now, tap);
   const eyes::Scene &s = anim.scene();
 
-  eyes::Rect r = ballRect(s);
+  eyes::Prepared p;
+  eyes::prepare(s, p);
+  eyes::Rect r = eyes::eyeBounds(p);
+  if (!isEmpty(r)) r = toPhysical(r);
+
   if (firstFrame || anim.needsFullRedraw()) {
-    // background is changing: redraw everything
-    pushRect(s, { 0, 0, LCD_SIZE - 1, LCD_SIZE - 1 });
+    // the face color is changing: redraw the whole screen
+    pushRect(s, p, { 0, 0, LCD_SIZE - 1, LCD_SIZE - 1 });
     firstFrame = false;
   } else {
-    // only the area the ball covered last frame and covers now
-    eyes::Rect u = { min(r.x0, prevRect.x0), min(r.y0, prevRect.y0),
-               max(r.x1, prevRect.x1), max(r.y1, prevRect.y1) };
-    pushRect(s, u);
+    // the face is a solid color, so only the area around the eyes
+    // (where they were last frame + where they are now) needs redrawing
+    pushRect(s, p, unite(r, prevRect));
   }
   prevRect = r;
 

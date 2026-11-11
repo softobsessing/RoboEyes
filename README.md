@@ -1,12 +1,12 @@
 # RoboEyes
 
-A little ball character with two pill-shaped eyes for the **Waveshare ESP32-S3-Touch-AMOLED-1.43** (466×466 round AMOLED, capacitive touch).
+Two pill-shaped eyes for the **Waveshare ESP32-S3-Touch-AMOLED-1.43** (466×466 round AMOLED, capacitive touch).
 
-- **Idle:** white ball on a black screen. The eyes are cut-outs, both blink together, and the ball floats and glances around.
-- **Tap:** the ball looks around and the screen inverts with a circular wipe: white screen, black ball.
-- **Tap again:** back to black (or set `AUTO_RETURN_MS` to go back automatically).
+The round screen itself is the character's face. It's rendered as a 3D ball the exact size of the display, so only the eyes are drawn, and they squash and lean naturally as the face looks around.
 
-The ball is rendered as a real 3D sphere, so the eyes squash and lean naturally as it looks toward its edge.
+- **Idle:** white face, black eyes. Both eyes blink together and keep gliding around.
+- **Tap:** the eyes look around and the face inverts with a circular wipe: black face, white eyes.
+- **Tap again:** back to white (or set `AUTO_RETURN_MS` to go back automatically).
 
 ![preview](extras/preview/preview.png)
 
@@ -38,14 +38,14 @@ Everything you're likely to change is at the top of `RoboEyes.ino`:
 
 | Setting | What it does |
 |---|---|
-| `IDLE_BACKGROUND`, `IDLE_BALL` | Colors before tapping (`0xRRGGBB`) |
-| `TAP_BACKGROUND`, `TAP_BALL` | Colors after tapping |
-| `BALL_RADIUS` | Ball size in pixels (screen is 466 wide) |
+| `IDLE_FACE`, `IDLE_EYES` | Colors before tapping (`0xRRGGBB`) |
+| `TAP_FACE`, `TAP_EYES` | Colors after tapping |
+| `FACE_RADIUS` | Size of the ball the eyes sit on (236 = fills the screen; bigger = bigger eyes) |
 | `HOME_YAW`, `HOME_PITCH`, `HOME_ROLL` | Resting gaze direction (default: up and to the right, like the reference art) |
-| `GAZE_WANDER`, `BALL_DRIFT` | How much it looks around / floats while idle |
+| `GAZE_WANDER`, `GAZE_DRIFT` | How much the eyes look around / float while idle |
 | `EYE_SPACING`, `EYE_HEIGHT`, `EYE_WIDTH`, `EYE_LENGTH`, `EYE_TILT` | Eye shape and placement |
-| `WIPE_MS` | Speed of the black/white inversion |
-| `AUTO_RETURN_MS` | `0` = tap toggles; otherwise return to black after N ms |
+| `WIPE_MS` | Speed of the white/black inversion |
+| `AUTO_RETURN_MS` | `0` = tap toggles; otherwise return to white after N ms |
 | `SCREEN_ROTATION` | `0`, `90`, `180`, `270` if the image is sideways |
 | `BRIGHTNESS` | `0`–`255` |
 

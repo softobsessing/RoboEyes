@@ -6,6 +6,7 @@
 // as they turn toward the edge of the ball, exactly like the reference art.
 //
 // The eyes are "holes" in the ball: they always show the background color.
+// In RoboEyes the ball is as big as the round screen, so the screen *is* the face.
 //
 // Pure C++ (no Arduino dependencies) so it can also run on a PC for previews.
 #pragma once
@@ -15,6 +16,7 @@
 namespace eyes {
 
 struct Color { float r, g, b; };
+struct Rect { int x0, y0, x1, y1; };   // inclusive pixel rectangle
 
 static inline Color hexColor(uint32_t c) {
   return { float((c >> 16) & 0xFF), float((c >> 8) & 0xFF), float(c & 0xFF) };
@@ -109,6 +111,18 @@ static inline void prepare(const Scene &s, Prepared &p) {
   p.fgB565 = pack565(s.fgB.r, s.fgB.g, s.fgB.b);
 }
 
+// Logical-space bounding box of both eyes (empty rect if they face away).
+static inline Rect eyeBounds(const Prepared &p) {
+  if (!p.eyesVisible) return { 0, 0, -1, -1 };
+  float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+  for (int i = 0; i < 2; i++) {
+    float r = sqrtf(p.eyeBR2[i]);
+    x0 = fminf(x0, p.eyeBX[i] - r); x1 = fmaxf(x1, p.eyeBX[i] + r);
+    y0 = fminf(y0, p.eyeBY[i] - r); y1 = fmaxf(y1, p.eyeBY[i] + r);
+  }
+  return { (int)floorf(x0), (int)floorf(y0), (int)ceilf(x1), (int)ceilf(y1) };
+}
+
 // Signed distance (in face units) to one pill eye, including eyelids.
 static inline float pillDist(const Scene &s, const Prepared &p, float fu, float fv, float side) {
   float x = fu - side * s.eye.spacing;
@@ -141,8 +155,6 @@ static inline float eyeHoleCoverage(const Scene &s, const Prepared &p, float dx,
   float k = nz / lz; k = k < 0.15f ? 0.15f : (k > 1.f ? 1.f : k);
   return clamp01(0.5f - d * s.ballR * k);
 }
-
-struct Rect { int x0, y0, x1, y1; };   // inclusive pixel rectangle
 
 // Maps a physical pixel to logical (scene) coordinates, for screen rotation.
 struct Xform {
