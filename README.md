@@ -46,7 +46,7 @@ Everything you're likely to change is at the top of `RoboEyes.ino`:
 | `EYE_SPACING`, `EYE_HEIGHT`, `EYE_WIDTH`, `EYE_LENGTH`, `EYE_TILT` | Eye shape and placement |
 | `WIPE_MS` | Speed of the white/black inversion |
 | `AUTO_RETURN_MS` | `0` = tap toggles; otherwise return to white after N ms |
-| `SCREEN_ROTATION` | `0`, `90`, `180`, `270` if the image is sideways |
+| `SCREEN_ROTATION` | Turns the picture clockwise: `0`, `90` (default), `180`, `270` |
 | `BRIGHTNESS` | `0`–`255` |
 
 ### Previewing on a computer

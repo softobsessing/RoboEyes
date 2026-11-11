@@ -62,7 +62,7 @@
 #define EYE_LENGTH        0.42f      // pill length (tip to tip)
 #define EYE_TILT          0          // degrees, leans the pill tops outward
 
-#define SCREEN_ROTATION   0          // 0, 90, 180, 270 if it looks sideways
+#define SCREEN_ROTATION   90         // turns the picture clockwise: 0, 90, 180, 270
 #define BRIGHTNESS        255        // 0..255
 
 // =====================================================================
@@ -207,21 +207,6 @@ static bool isTouched() {
 static eyes::Animator anim;
 static eyes::Xform xform;
 
-// Logical rect -> physical rect, honoring SCREEN_ROTATION.
-static eyes::Rect toPhysical(eyes::Rect l) {
-  float W = LCD_SIZE;
-  float lx0 = l.x0, lx1 = l.x1 + 1, ly0 = l.y0, ly1 = l.y1 + 1;
-  float ax, ay, bx, by;   // logical -> physical for two opposite corners
-  switch (SCREEN_ROTATION) {
-    case 90:  ax = W - ly0; ay = lx0; bx = W - ly1; by = lx1; break;
-    case 180: ax = W - lx0; ay = W - ly0; bx = W - lx1; by = W - ly1; break;
-    case 270: ax = ly0; ay = W - lx0; bx = ly1; by = W - lx1; break;
-    default:  ax = lx0; ay = ly0; bx = lx1; by = ly1; break;
-  }
-  return { (int)floorf(fminf(ax, bx)), (int)floorf(fminf(ay, by)),
-           (int)ceilf(fmaxf(ax, bx)) - 1, (int)ceilf(fmaxf(ay, by)) - 1 };
-}
-
 static bool isEmpty(const eyes::Rect &r) { return r.x1 < r.x0 || r.y1 < r.y0; }
 
 static eyes::Rect unite(const eyes::Rect &a, const eyes::Rect &b) {
@@ -300,7 +285,7 @@ void loop() {
   eyes::Prepared p;
   eyes::prepare(s, p);
   eyes::Rect r = eyes::eyeBounds(p);
-  if (!isEmpty(r)) r = toPhysical(r);
+  r = eyes::logicalToPhysical(r, SCREEN_ROTATION, LCD_SIZE);
 
   if (firstFrame || anim.needsFullRedraw()) {
     // the face color is changing: redraw the whole screen

@@ -171,6 +171,22 @@ static inline Xform makeXform(int rotation, int size) {
   }
 }
 
+// Logical (scene) rect -> physical (panel) rect; the inverse of makeXform.
+static inline Rect logicalToPhysical(Rect l, int rotation, int size) {
+  if (l.x1 < l.x0 || l.y1 < l.y0) return l;
+  float W = (float)size;
+  float lx0 = (float)l.x0, lx1 = (float)l.x1 + 1, ly0 = (float)l.y0, ly1 = (float)l.y1 + 1;
+  float ax, ay, bx, by;   // two opposite corners
+  switch (rotation) {
+    case 90:  ax = W - ly0; ay = lx0;     bx = W - ly1; by = lx1;     break;
+    case 180: ax = W - lx0; ay = W - ly0; bx = W - lx1; by = W - ly1; break;
+    case 270: ax = ly0;     ay = W - lx0; bx = ly1;     by = W - lx1; break;
+    default:  ax = lx0;     ay = ly0;     bx = lx1;     by = ly1;     break;
+  }
+  return { (int)floorf(fminf(ax, bx)), (int)floorf(fminf(ay, by)),
+           (int)ceilf(fmaxf(ax, bx)) - 1, (int)ceilf(fmaxf(ay, by)) - 1 };
+}
+
 // Render a rectangle of physical pixels [x0, x0+w) x [y0, y0+h) into buf (stride w).
 static inline void renderRect(const Scene &s, const Prepared &p, const Xform &xf,
                               uint16_t *buf, int x0, int y0, int w, int h) {
