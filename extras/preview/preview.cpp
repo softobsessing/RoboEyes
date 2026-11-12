@@ -19,7 +19,8 @@ int main(int argc, char **argv) {
   // keep in sync with the settings at the top of RoboEyes.ino
   c.idleFace = 0xFFFFFF; c.idleEyes = 0x000000; c.tapFace = 0x0B0B0E; c.tapEyes = 0xF4F4F4;
   c.faceRadius = 236; c.homeYaw = 28; c.homePitch = 27; c.homeRoll = -10;
-  c.wander = 10; c.drift = 4; c.gazeSpeed = 1; c.wipeMs = 650; c.autoReturnMs = 0;
+  c.wander = 10; c.drift = 4; c.gazeSpeed = 1; c.followYaw = 40; c.followPitch = 30;
+  c.wipeMs = 650; c.autoReturnMs = 0;
   c.eye = { 0.25f, 0.0f, 0.10f, 0.11f, 0.0f }; c.screenSize = N;
   Animator a; a.begin(c, 12345, 1);
 
@@ -30,7 +31,8 @@ int main(int argc, char **argv) {
   for (uint32_t t = 1; tile < COLS * ROWS; t += 10) {     // simulate at 100 fps
     bool tap = false;
     for (uint32_t tp : taps) if (t <= tp && tp < t + 10) tap = true;
-    a.update(t, tap);
+    if (tap) a.tap(t);
+    a.update(t);
     if (t >= FIRST_MS && (t - FIRST_MS) % STEP_MS < 10) {
       Prepared p; prepare(a.scene(), p);
       renderRect(a.scene(), p, xf, frame.data(), 0, 0, N, N);

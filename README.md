@@ -50,7 +50,9 @@ Everything you're likely to change is at the top of `RoboEyes.ino`:
 | `SCREEN_ROTATION` | Turns the picture clockwise: `0`, `90` (default), `180`, `270` |
 | `BRIGHTNESS` | `0`–`255` |
 | `TARGET_FPS` | Frame-rate cap (default 60) |
-| `SHOW_FPS` | `1` = print frames per second to the Serial Monitor (115200 baud) |
+| `SHOW_FPS` | `1` = print `D fps …` to the Serial Monitor (115200 baud) every 10 s |
+| `FOLLOW_YAW`, `FOLLOW_PITCH` | How far the eyes turn when the website says "look all the way left/right/up/down" |
+| `BLE_NAME` | Bluetooth name; keep `EyeBuddy` (the website looks for it) |
 
 ### Previewing on a computer
 
@@ -63,6 +65,42 @@ clang++ -O2 -std=c++17 -o preview extras/preview/preview.cpp
 
 (The preview uses its own copy of the settings at the top of `preview.cpp`.)
 
+## Website control
+
+The website **https://softobsessing.github.io/doomscroll-eyes/** controls the moods. It watches you through your webcam and connects to the board over **USB** (Connect USB) or **Bluetooth** (Connect Bluetooth → pick `EyeBuddy`).
+
+| Mood (website button) | Eyes |
+|---|---|
+| focused (`neutral`) | the reference pills |
+| welcome back (`happy`) | arches, `^ ^` |
+| side-eye (`side`) | flat, half-closed upper lids |
+| disappointed (`sad`) | droopy outer corners, head dipped |
+
+![moods](extras/preview/moods.png)
+
+_Top: looking straight ahead. Bottom: looking up and to the right._
+
+While connected, the website also sets where the eyes look (they follow you) and when they blink, and the eyelids morph smoothly between moods. A tap on the board still flips the colors, and the website's preview flips too. If the website goes quiet for 3 s, the board goes back to doing its own thing.
+
+The website's live preview (`eyes.js` in the doomscroll-eyes repo) is a line-for-line JavaScript port of `eyes_render.h` + `eyes_anim.h`, so it shows exactly what the board shows. **If you change shapes, moods or timings here, change `eyes.js` too**, then check they still match:
+
+```sh
+clang++ -O2 -std=c++17 -o parity extras/parity/parity.cpp && ./parity /tmp/parity_out
+cd ../doomscroll-eyes && node test/eyes_port.test.mjs /tmp/parity_out
+```
+
+### Protocol (text lines, same over USB serial at 115200 and Bluetooth Nordic UART)
+
+| Direction | Line | Meaning |
+|---|---|---|
+| website → board | `E <neutral\|happy\|side\|sad> <lookX> <lookY>` | mood + where to look (−100..100, + = right / down), ~20 per second |
+| website → board | `B` / `B2` | blink now / double blink |
+| website → board | `P` | ping |
+| board → website | `HELLO RoboEyes 1` | on boot and in reply to `P` |
+| board → website | `T touch` / `T release` | finger down / up |
+| board → website | `C light` / `C dark` | current colors (on `HELLO` and whenever a tap flips them) |
+| board → website | `D fps <n> draw_ms <n>` | USB only, every 10 s (frame rate; the website ignores it) |
+
 ## How it stays smooth
 
 Every frame is generated live, so smoothness comes down to frames per second and how far the eyes move between frames:
@@ -73,7 +111,7 @@ Every frame is generated live, so smoothness comes down to frames per second and
 - **Touch is read on a background task**, so it can never delay a frame.
 - **Motion eases in and out.** Eye movement goes through two smoothing stages, so speed rises and falls gently, and a new target mid-move blends in without a jerk.
 
-Open the Serial Monitor at 115200 baud to see the live frame rate.
+Open the Serial Monitor at 115200 baud to see the live frame rate (close it before connecting the website over USB: only one program can use the port).
 
 ## Hardware pins
 
@@ -88,4 +126,5 @@ Open the Serial Monitor at 115200 baud to see the live frame rate.
 ## Credits
 
 - `esp_lcd_sh8601.c/.h`: Espressif Systems, Apache-2.0, as bundled in Waveshare's demo package.
+- `ble_link.cpp/.h`: from the EyeBuddy firmware in the doomscroll-eyes repo.
 - `read_lcd_id_bsp.c/.h`: from Waveshare's [ESP32-S3-Touch-AMOLED-1.43 demo](https://www.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.43).

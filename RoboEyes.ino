@@ -10,6 +10,11 @@
  *   (black face, white eyes).
  * - Tap again: back to white. (Or set AUTO_RETURN_MS to revert by itself.)
  *
+ * Website control: https://softobsessing.github.io/doomscroll-eyes/ connects
+ * over USB or Bluetooth ("EyeBuddy") and picks the mood (neutral / happy /
+ * side-eye / disappointed) and where the eyes look. Its live preview runs the
+ * same eye code, so the website and the board show the same thing.
+ *
  * Every frame is generated live, so smoothness = frames per second. To keep
  * that high, only the pixels that changed are redrawn, both CPU cores share
  * the drawing, and touch is read on a background task. Open the Serial
@@ -36,6 +41,7 @@
 #include "eyes_render.h"
 #include "eyes_anim.h"
 #include "eyes_dirty.h"
+#include "ble_link.h"
 
 // =====================================================================
 //  LOOK & FEEL - tweak these
@@ -73,7 +79,13 @@
 #define SCREEN_ROTATION   90         // turns the picture clockwise: 0, 90, 180, 270
 #define BRIGHTNESS        255        // 0..255
 #define TARGET_FPS        60         // frame-rate cap
-#define SHOW_FPS          1          // print frames-per-second to the Serial Monitor
+#define SHOW_FPS          1          // every 10 s print "D fps ..." to the Serial Monitor
+
+// Website link. Keep BLE_NAME = "EyeBuddy": that's the name the website looks for.
+#define BLE_NAME          "EyeBuddy"
+#define FOLLOW_YAW        40         // degrees the eyes turn when the website looks fully left/right
+#define FOLLOW_PITCH      30         // degrees the eyes turn when the website looks fully up/down
+#define LINK_TIMEOUT_MS   3000       // no message from the website this long = back to standalone
 
 // =====================================================================
 //  BOARD PINS (Waveshare ESP32-S3-Touch-AMOLED-1.43) - don't change
@@ -194,7 +206,7 @@ static void displayInit() {
 // =====================================================================
 //  Touch (FT3168) - polled on its own task so it can never stall a frame
 // =====================================================================
-static volatile bool tapPending = false;
+static volatile bool touchDownPending = false, touchUpPending = false;
 
 static bool isTouched() {
   Wire.beginTransmission(FT3168_ADDR);
@@ -206,13 +218,13 @@ static bool isTouched() {
 }
 
 static void touchTask(void *) {
-  bool was = false;
-  uint32_t lastTap = 0;
+  bool down = false;
+  uint32_t lastDown = 0;
   for (;;) {
     bool now = isTouched();
     uint32_t ms = millis();
-    if (now && !was && ms - lastTap > 250) { tapPending = true; lastTap = ms; }
-    was = now;
+    if (now && !down && ms - lastDown > 250) { down = true; lastDown = ms; touchDownPending = true; }
+    else if (!now && down) { down = false; touchUpPending = true; }
     vTaskDelay(pdMS_TO_TICKS(15));
   }
 }
@@ -280,17 +292,88 @@ static void pushRect(const eyes::Scene &s, const eyes::Prepared &p, const eyes::
 }
 
 // =====================================================================
+//  Website link (same text protocol over USB serial and Bluetooth)
+//   website -> board   E <neutral|happy|side|sad> <lookX -100..100> <lookY -100..100>   (~20/s)
+//                      B | B2          blink now / double blink (the website is the blink clock)
+//                      P               ping
+//   board -> website   HELLO RoboEyes 1
+//                      T touch | T release
+//                      C light | C dark     colors (sent on HELLO and whenever a tap flips them)
+//                      D fps <n> draw_ms <n>   (USB only, every 10 s; the website ignores it)
+// =====================================================================
+static bool haveLink = false;
+static uint32_t lastLinkMs = 0;
+static eyes::Mood linkMood = eyes::NEUTRAL;
+static float linkX = 0, linkY = 0;
+
+static void emit(const char *line) {
+  Serial.println(line);
+  ble_send_line(line);
+}
+
+static void emitColors() { emit(anim.isInverted() ? "C dark" : "C light"); }
+
+static bool linked(uint32_t now) { return haveLink && now - lastLinkMs < LINK_TIMEOUT_MS; }
+
+static void onLine(const char *line, uint32_t now) {
+  if (line[0] == 'P' && line[1] == 0) {
+    emit("HELLO RoboEyes 1");
+    emitColors();
+    return;
+  }
+  if (line[0] == 'B' && (line[1] == 0 || (line[1] == '2' && line[2] == 0))) {
+    if (linked(now)) anim.blinkNow(now, line[1] == '2');
+    return;
+  }
+  char mood[16];
+  int x = 0, y = 0;
+  eyes::Mood m;
+  if (sscanf(line, "E %15s %d %d", mood, &x, &y) >= 1 && eyes::parseMood(mood, &m)) {
+    if (!linked(now)) anim.blinkNow(now, false);   // the website just connected: blink hello
+    haveLink = true;
+    lastLinkMs = now;
+    linkMood = m;
+    linkX = (x < -100 ? -100 : x > 100 ? 100 : x) / 100.f;
+    linkY = (y < -100 ? -100 : y > 100 ? 100 : y) / 100.f;
+  }
+}
+
+struct LineReader {
+  char buf[96];
+  size_t len = 0;
+  void feed(char c, uint32_t now) {
+    if (c == '\n' || c == '\r') {
+      if (len) { buf[len] = 0; onLine(buf, now); len = 0; }
+    } else if (len < sizeof(buf) - 1) {
+      buf[len++] = c;
+    } else {
+      len = 0;   // garbage / overlong line: drop it
+    }
+  }
+};
+static LineReader usbLine, bleLine;
+
+static void pollLinks(uint32_t now) {
+  while (Serial.available() > 0) usbLine.feed((char)Serial.read(), now);
+  char tmp[64];
+  size_t n;
+  while ((n = ble_read(tmp, sizeof tmp)) > 0)
+    for (size_t i = 0; i < n; i++) bleLine.feed(tmp[i], now);
+}
+
+// =====================================================================
 //  Arduino entry points
 // =====================================================================
 void setup() {
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);   // never stall the animation when no computer is listening
   delay(200);
   displayInit();
   touchInit();
   setBrightness(BRIGHTNESS);
 
   loopHandle = xTaskGetCurrentTaskHandle();
-  xTaskCreatePinnedToCore(renderWorker, "render", 4096, nullptr, configMAX_PRIORITIES - 2, &workerHandle, 0);
+  xTaskCreatePinnedToCore(renderWorker, "render", 4096, nullptr, 3, &workerHandle, 0);
 
   eyes::AnimConfig cfg;
   cfg.idleFace = IDLE_FACE;  cfg.idleEyes = IDLE_EYES;
@@ -300,6 +383,8 @@ void setup() {
   cfg.wander = GAZE_WANDER;
   cfg.drift = GAZE_DRIFT;
   cfg.gazeSpeed = GAZE_SPEED;
+  cfg.followYaw = FOLLOW_YAW;
+  cfg.followPitch = FOLLOW_PITCH;
   cfg.wipeMs = WIPE_MS;
   cfg.autoReturnMs = AUTO_RETURN_MS;
   cfg.eye.spacing = EYE_SPACING;
@@ -311,7 +396,9 @@ void setup() {
   anim.begin(cfg, esp_random(), millis());
   xform = eyes::makeXform(SCREEN_ROTATION, LCD_SIZE);
   dirty.begin(SCREEN_ROTATION, LCD_SIZE);
-  Serial.println("RoboEyes ready - tap the screen!");
+  ble_begin(BLE_NAME);
+  emit("HELLO RoboEyes 1");
+  emitColors();
 }
 
 void loop() {
@@ -319,10 +406,26 @@ void loop() {
   static uint32_t nextFrameUs = micros();
   uint32_t startUs = micros();
 
-  bool tap = tapPending;
-  if (tap) tapPending = false;
+  uint32_t now = millis();
 
-  anim.update(millis(), tap);
+  // touch: a tap looks around and flips the colors; tell the website so its preview follows
+  if (touchDownPending) {
+    touchDownPending = false;
+    anim.tap(now);
+    emit("T touch");
+    emitColors();
+  }
+  if (touchUpPending) { touchUpPending = false; emit("T release"); }
+
+  // the website (if connected) picks the mood, the gaze and when to blink
+  pollLinks(now);
+  bool isLinked = linked(now);
+  anim.setLinked(isLinked);
+  anim.setAutoBlink(!isLinked);
+  anim.setMood(isLinked ? linkMood : eyes::NEUTRAL);
+  if (isLinked) anim.setLook(linkX, linkY);
+
+  anim.update(now);
   const eyes::Scene &s = anim.scene();
   eyes::Prepared p;
   eyes::prepare(s, p);
@@ -337,9 +440,9 @@ void loop() {
   static uint32_t frames = 0, busyUs = 0, reportMs = millis();
   frames++;
   busyUs += micros() - startUs;
-  if (millis() - reportMs >= 2000) {
+  if (millis() - reportMs >= 10000) {
     float secs = (millis() - reportMs) / 1000.f;
-    Serial.printf("fps %.1f   draw %.1f ms/frame\n", frames / secs, busyUs / 1000.f / frames);
+    Serial.printf("D fps %.1f draw_ms %.1f\n", frames / secs, busyUs / 1000.f / frames);
     frames = 0; busyUs = 0; reportMs = millis();
   }
 #endif

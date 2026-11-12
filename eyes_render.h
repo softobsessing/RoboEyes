@@ -48,6 +48,10 @@ struct Scene {
   float ballX, ballY, ballR;   // ball center / radius in screen pixels
   float yaw, pitch, roll;      // radians: + yaw = look right, + pitch = look up, + roll = clockwise
   float blink;                 // 1 = open, 0 = shut
+  // mood eyelids (fractions of the pill), smoothly animated by the animator
+  float lidTop;                // 0..1: how far the upper lid comes down
+  float lidSlant;              // + = outer corners droop (sad), - = inner corners (angry)
+  float lidHappy;              // 0..1: curved lower lid pushing up (happy "^ ^")
   Color bgA, fgA;              // eye / face color outside the wipe circle
   Color bgB, fgB;              // eye / face color inside the wipe circle
   float wipeX, wipeY, wipeR;   // wipe circle; wipeR <= 0 means no wipe
@@ -74,7 +78,13 @@ struct Prepared {
   float ct, st;                      // pill tilt
   float invR;
   float r2in, r2out;                 // (R-1)^2, (R+1)^2
-  float openLen;                     // half-extent left open by the eyelids
+  float L;                           // half length of the pill, tip to tip
+  float B, hl;                       // pill radius (half width) and straight half-length this frame
+  float topC, topK, topNorm;         // upper lid line: a = topC + topK * outer
+  bool  happyOn;
+  float cutA;                        // happy: lower lid rises to here...
+  float holeR, holeA;                // ...and a hole opens under the top cap, leaving an arch
+  float aMid, openHalf;              // blink closes toward aMid; half-height left open
   bool  eyeOn[2];                    // eye faces the viewer
   Box   eyeBox[2];                   // tight logical-pixel bounds of each eye (incl. anti-aliasing)
   uint16_t bgA565, fgA565, bgB565, fgB565;
@@ -103,21 +113,44 @@ static inline void prepare(const Scene &s, Prepared &p) {
   p.r2in = (s.ballR - 1) * (s.ballR - 1);
   p.r2out = (s.ballR + 1) * (s.ballR + 1);
 
-  // Lids: when shut, leave a thin dash (~5 px) so a blink reads as a closed eye.
-  float fullLen = s.eye.halfLen + s.eye.radius;
-  float minOpen = 2.4f / s.ballR;
-  p.openLen = fmaxf(clamp01(s.blink) * fullLen, minOpen);
+  // Pill coordinates: a runs along the pill (top = -L, bottom = +L), b across it.
+  // Happy widens the pill so its arch reads clearly.
+  const float h = clamp01(s.lidHappy);
+  const float B = s.eye.radius * (1.f + 0.6f * h), hl = s.eye.halfLen;
+  const float L = hl + B;
+  p.L = L; p.B = B; p.hl = hl;
+  // upper lid: hides everything above the line a = topC + topK * outer
+  p.topC = -L + 2.f * L * clamp01(s.lidTop);
+  p.topK = s.lidSlant * L / B;
+  p.topNorm = 1.f / sqrtf(1.f + p.topK * p.topK);
+  // happy: a lower lid rises to just under the top cap and a hole opens in the
+  // cap, so the pill becomes an arch (an upside-down U, like "^ ^")
+  p.happyOn = h > 0.001f;
+  p.holeA = -hl + 0.1f * B;
+  p.holeR = h * 0.55f * B;
+  p.cutA = L + ((-hl + 0.3f * B) - L) * h;
+  // visible span down the middle of the pill
+  float aTop = fmaxf(-L, p.topC), aBot = p.cutA;
+  if (aBot < aTop + 0.02f) aBot = aTop + 0.02f;
+  // blinks close toward the middle of what's visible (the top of the arch when happy)
+  float openMid = 0.5f * (aTop + aBot);
+  float closeMid = openMid + (0.5f * (aTop + fmaxf(aTop, p.holeA - p.holeR)) - openMid) * h;
+  float bl = clamp01(s.blink);
+  p.aMid = closeMid + (openMid - closeMid) * bl;
+  // when shut, leave a thin dash (~5 px) so a blink reads as a closed eye
+  p.openHalf = fmaxf(bl * 0.5f * (aBot - aTop), 2.4f / s.ballR);
 
-  // Tight screen bounds: trace the rectangle that encloses the (lidded) pill,
+  // Tight screen bounds: trace the rectangle that encloses the visible pill,
   // project it onto the screen, and take the min/max.
-  const float A = fminf(p.openLen, fullLen), B = s.eye.radius;
+  const float A0 = fmaxf(-L, p.aMid - p.openHalf), A1 = fminf(L, p.aMid + p.openHalf);
   const int K = 6;   // samples per side
   for (int e = 0; e < 2; e++) {
     float side = e == 0 ? -1.f : 1.f, st = p.st * side;
     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, zmax = -2.f;
     for (int k = 0; k <= K; k++) {
-      float t = -1.f + 2.f * k / K;
-      const float pts[4][2] = { { -B, t * A }, { B, t * A }, { t * B, -A }, { t * B, A } };
+      float t = (float)k / K;
+      float ta = A0 + (A1 - A0) * t, tb = -B + 2.f * B * t;
+      const float pts[4][2] = { { -B, ta }, { B, ta }, { tb, A0 }, { tb, A1 } };
       for (int q = 0; q < 4; q++) {
         float b = pts[q][0], a = pts[q][1];
         float fu = b * p.ct + a * st + side * s.eye.spacing;   // pill axes -> face
@@ -157,10 +190,20 @@ static inline float pillDist(const Scene &s, const Prepared &p, float fu, float 
   float b = x * p.ct - y * st;        // across the pill
   float a = x * st + y * p.ct;        // along the pill
   float aa = fabsf(a);
-  float ex = aa - s.eye.halfLen; ex = ex > 0 ? ex : 0;
-  float d = sqrtf(b * b + ex * ex) - s.eye.radius;
-  float lid = aa - p.openLen;         // top + bottom eyelids
-  return d > lid ? d : lid;
+  float ex = aa - p.hl; ex = ex > 0 ? ex : 0;
+  float d = sqrtf(b * b + ex * ex) - p.B;                    // the pill itself
+  float outer = b * side;                                    // + toward the outer corner
+  float top = (p.topC + p.topK * outer - a) * p.topNorm;     // mood: upper lid
+  if (top > d) d = top;
+  if (p.happyOn) {                                           // mood: happy arch
+    float cut = a - p.cutA;
+    if (cut > d) d = cut;
+    float da = a - p.holeA;
+    float hole = p.holeR - sqrtf(b * b + da * da);
+    if (hole > d) d = hole;
+  }
+  float blink = fabsf(a - p.aMid) - p.openHalf;              // blink lids
+  return d > blink ? d : blink;
 }
 
 // Coverage (0..1) of the eye holes at a pixel. mask: bit0 = left eye, bit1 = right eye.
