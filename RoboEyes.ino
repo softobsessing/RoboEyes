@@ -10,9 +10,15 @@
  *   (black face, white eyes).
  * - Tap again: back to white. (Or set AUTO_RETURN_MS to revert by itself.)
  *
+ * Every frame is generated live, so smoothness = frames per second. To keep
+ * that high, only the pixels that changed are redrawn, both CPU cores share
+ * the drawing, and touch is read on a background task. Open the Serial
+ * Monitor (115200) to see the frame rate.
+ *
  * Arduino IDE settings (Tools menu):
  *   Board:            ESP32S3 Dev Module
  *   USB CDC On Boot:  Enabled
+ *   CPU Frequency:    240MHz (WiFi)
  *   Flash Size:       16MB
  *   PSRAM:            OPI PSRAM
  * Board package: "esp32 by Espressif Systems" 3.1.x or newer. No extra libraries needed.
@@ -29,6 +35,7 @@
 #include "read_lcd_id_bsp.h"
 #include "eyes_render.h"
 #include "eyes_anim.h"
+#include "eyes_dirty.h"
 
 // =====================================================================
 //  LOOK & FEEL - tweak these
@@ -52,8 +59,9 @@
 
 #define GAZE_WANDER       10         // degrees the gaze wanders around while idle
 #define GAZE_DRIFT        4          // degrees of slow continuous floating
-#define WIPE_MS           550        // speed of the black/white inversion
-#define AUTO_RETURN_MS    0          // 0 = tap toggles; else go back to black after N ms
+#define GAZE_SPEED        1.0f       // eye movement speed: lower = slower and silkier
+#define WIPE_MS           650        // speed of the white/black inversion
+#define AUTO_RETURN_MS    0          // 0 = tap toggles; else go back to white after N ms
 
 // Eye shape, in fractions of the ball radius
 #define EYE_SPACING       0.25f      // half the distance between the eyes
@@ -64,6 +72,8 @@
 
 #define SCREEN_ROTATION   90         // turns the picture clockwise: 0, 90, 180, 270
 #define BRIGHTNESS        255        // 0..255
+#define TARGET_FPS        60         // frame-rate cap
+#define SHOW_FPS          1          // print frames-per-second to the Serial Monitor
 
 // =====================================================================
 //  BOARD PINS (Waveshare ESP32-S3-Touch-AMOLED-1.43) - don't change
@@ -82,7 +92,7 @@
 #define FT3168_ADDR  0x38
 
 #define SH8601_ID    0x86
-#define STRIP_ROWS   24     // rows per DMA transfer (must be even)
+#define BUF_PIXELS   (LCD_SIZE * 32)   // pixels per DMA buffer (two buffers)
 
 // =====================================================================
 //  Display driver (uses Waveshare's esp_lcd_sh8601 driver)
@@ -142,7 +152,7 @@ static void displayInit() {
   bus.data5_io_num = -1;
   bus.data6_io_num = -1;
   bus.data7_io_num = -1;
-  bus.max_transfer_sz = LCD_SIZE * STRIP_ROWS * 2 + 64;
+  bus.max_transfer_sz = BUF_PIXELS * 2 + 64;
   ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
 
   esp_lcd_panel_io_spi_config_t io = {};
@@ -175,22 +185,16 @@ static void displayInit() {
   ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
   for (int i = 0; i < 2; i++) {
-    dmaBuf[i] = (uint16_t *)heap_caps_malloc(LCD_SIZE * STRIP_ROWS * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    dmaBuf[i] = (uint16_t *)heap_caps_malloc(BUF_PIXELS * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     assert(dmaBuf[i]);
   }
   bufFree = xSemaphoreCreateCounting(2, 2);
 }
 
 // =====================================================================
-//  Touch (FT3168)
+//  Touch (FT3168) - polled on its own task so it can never stall a frame
 // =====================================================================
-static void touchInit() {
-  Wire.begin(PIN_TP_SDA, PIN_TP_SCL, 400000);
-  Wire.beginTransmission(FT3168_ADDR);
-  Wire.write(0x00);   // device mode register
-  Wire.write(0x00);   // normal operating mode
-  Wire.endTransmission();
-}
+static volatile bool tapPending = false;
 
 static bool isTouched() {
   Wire.beginTransmission(FT3168_ADDR);
@@ -201,36 +205,75 @@ static bool isTouched() {
   return n > 0 && n < 6;
 }
 
+static void touchTask(void *) {
+  bool was = false;
+  uint32_t lastTap = 0;
+  for (;;) {
+    bool now = isTouched();
+    uint32_t ms = millis();
+    if (now && !was && ms - lastTap > 250) { tapPending = true; lastTap = ms; }
+    was = now;
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+}
+
+static void touchInit() {
+  Wire.begin(PIN_TP_SDA, PIN_TP_SCL, 400000);
+  Wire.setTimeOut(10);
+  Wire.beginTransmission(FT3168_ADDR);
+  Wire.write(0x00);   // device mode register
+  Wire.write(0x00);   // normal operating mode
+  Wire.endTransmission();
+  xTaskCreatePinnedToCore(touchTask, "touch", 4096, nullptr, 1, nullptr, 0);
+}
+
 // =====================================================================
-//  Drawing
+//  Drawing - both CPU cores render each strip, DMA sends while we draw the next
 // =====================================================================
 static eyes::Animator anim;
 static eyes::Xform xform;
+static eyes::DirtyTracker dirty;
 
-static bool isEmpty(const eyes::Rect &r) { return r.x1 < r.x0 || r.y1 < r.y0; }
+struct RenderJob {
+  const eyes::Scene *s;
+  const eyes::Prepared *p;
+  uint16_t *buf;
+  int x0, y0, w, rows;
+};
+static RenderJob job;
+static TaskHandle_t workerHandle = nullptr, loopHandle = nullptr;
 
-static eyes::Rect unite(const eyes::Rect &a, const eyes::Rect &b) {
-  if (isEmpty(a)) return b;
-  if (isEmpty(b)) return a;
-  return { min(a.x0, b.x0), min(a.y0, b.y0), max(a.x1, b.x1), max(a.y1, b.y1) };
+static void renderWorker(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    eyes::renderRect(*job.s, *job.p, xform, job.buf, job.x0, job.y0, job.w, job.rows);
+    xTaskNotifyGive(loopHandle);
+  }
 }
 
-// Render and send a rectangle in strips, double-buffered over DMA.
-static void pushRect(const eyes::Scene &s, const eyes::Prepared &p, eyes::Rect r) {
-  if (isEmpty(r)) return;
-  // panel needs even start and odd end coordinates
-  r.x0 = max(r.x0, 0) & ~1;
-  r.y0 = max(r.y0, 0) & ~1;
-  r.x1 = min(r.x1 | 1, LCD_SIZE - 1);
-  r.y1 = min(r.y1 | 1, LCD_SIZE - 1);
-  if (isEmpty(r)) return;
-  int w = r.x1 - r.x0 + 1;
+// Render one strip; the bottom half is drawn on core 0 at the same time.
+static void renderStrip(const eyes::Scene &s, const eyes::Prepared &p,
+                        uint16_t *buf, int x0, int y0, int w, int rows) {
+  if (!workerHandle || rows < 4) {
+    eyes::renderRect(s, p, xform, buf, x0, y0, w, rows);
+    return;
+  }
+  int top = rows / 2;
+  job = { &s, &p, buf + top * w, x0, y0 + top, w, rows - top };
+  xTaskNotifyGive(workerHandle);
+  eyes::renderRect(s, p, xform, buf, x0, y0, w, top);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+}
 
+// Render and send an aligned rect, in strips, double-buffered over DMA.
+static void pushRect(const eyes::Scene &s, const eyes::Prepared &p, const eyes::Rect &r) {
+  int w = r.x1 - r.x0 + 1;
+  int maxRows = (BUF_PIXELS / w) & ~1;   // narrow rects get tall strips
   static int which = 0;
-  for (int y = r.y0; y <= r.y1; y += STRIP_ROWS) {
-    int rows = min(STRIP_ROWS, r.y1 - y + 1);
+  for (int y = r.y0; y <= r.y1; y += maxRows) {
+    int rows = min(maxRows, r.y1 - y + 1);
     xSemaphoreTake(bufFree, portMAX_DELAY);
-    eyes::renderRect(s, p, xform, dmaBuf[which], r.x0, y, w, rows);
+    renderStrip(s, p, dmaBuf[which], r.x0, y, w, rows);
     esp_lcd_panel_draw_bitmap(panel, r.x0 + xGap, y, r.x1 + 1 + xGap, y + rows, dmaBuf[which]);
     which ^= 1;
   }
@@ -239,15 +282,15 @@ static void pushRect(const eyes::Scene &s, const eyes::Prepared &p, eyes::Rect r
 // =====================================================================
 //  Arduino entry points
 // =====================================================================
-static eyes::Rect prevRect = { 0, 0, -1, -1 };
-static bool firstFrame = true;
-
 void setup() {
   Serial.begin(115200);
   delay(200);
   displayInit();
   touchInit();
   setBrightness(BRIGHTNESS);
+
+  loopHandle = xTaskGetCurrentTaskHandle();
+  xTaskCreatePinnedToCore(renderWorker, "render", 4096, nullptr, configMAX_PRIORITIES - 2, &workerHandle, 0);
 
   eyes::AnimConfig cfg;
   cfg.idleFace = IDLE_FACE;  cfg.idleEyes = IDLE_EYES;
@@ -256,6 +299,7 @@ void setup() {
   cfg.homeYaw = HOME_YAW; cfg.homePitch = HOME_PITCH; cfg.homeRoll = HOME_ROLL;
   cfg.wander = GAZE_WANDER;
   cfg.drift = GAZE_DRIFT;
+  cfg.gazeSpeed = GAZE_SPEED;
   cfg.wipeMs = WIPE_MS;
   cfg.autoReturnMs = AUTO_RETURN_MS;
   cfg.eye.spacing = EYE_SPACING;
@@ -266,41 +310,47 @@ void setup() {
   cfg.screenSize = LCD_SIZE;
   anim.begin(cfg, esp_random(), millis());
   xform = eyes::makeXform(SCREEN_ROTATION, LCD_SIZE);
+  dirty.begin(SCREEN_ROTATION, LCD_SIZE);
   Serial.println("RoboEyes ready - tap the screen!");
 }
 
 void loop() {
-  static bool wasTouched = false;
-  static uint32_t lastTap = 0;
-  uint32_t now = millis();
+  const uint32_t FRAME_US = 1000000UL / TARGET_FPS;
+  static uint32_t nextFrameUs = micros();
+  uint32_t startUs = micros();
 
-  bool touched = isTouched();
-  bool tap = touched && !wasTouched && (now - lastTap > 250);
-  if (tap) lastTap = now;
-  wasTouched = touched;
+  bool tap = tapPending;
+  if (tap) tapPending = false;
 
-  anim.update(now, tap);
+  anim.update(millis(), tap);
   const eyes::Scene &s = anim.scene();
-
   eyes::Prepared p;
   eyes::prepare(s, p);
-  eyes::Rect r = eyes::eyeBounds(p);
-  r = eyes::logicalToPhysical(r, SCREEN_ROTATION, LCD_SIZE);
 
-  if (firstFrame || anim.needsFullRedraw()) {
-    // the face color is changing: redraw the whole screen
-    pushRect(s, p, { 0, 0, LCD_SIZE - 1, LCD_SIZE - 1 });
-    firstFrame = false;
-  } else {
-    // the face is a solid color, so only the area around the eyes
-    // (where they were last frame + where they are now) needs redrawing
-    pushRect(s, p, unite(r, prevRect));
+  float r0, r1;
+  bool ring = anim.wipeRing(r0, r1);
+  eyes::Rect rects[eyes::DirtyTracker::MAX_RECTS];
+  int n = dirty.collect(p, ring, r0, r1, rects);
+  for (int i = 0; i < n; i++) pushRect(s, p, rects[i]);
+
+#if SHOW_FPS
+  static uint32_t frames = 0, busyUs = 0, reportMs = millis();
+  frames++;
+  busyUs += micros() - startUs;
+  if (millis() - reportMs >= 2000) {
+    float secs = (millis() - reportMs) / 1000.f;
+    Serial.printf("fps %.1f   draw %.1f ms/frame\n", frames / secs, busyUs / 1000.f / frames);
+    frames = 0; busyUs = 0; reportMs = millis();
   }
-  prevRect = r;
+#endif
 
-  // cap at ~60 fps
-  static uint32_t last = 0;
-  uint32_t el = millis() - last;
-  if (el < 16) delay(16 - el);
-  last = millis();
+  // pace frames evenly (uneven frame timing reads as stutter)
+  nextFrameUs += FRAME_US;
+  int32_t wait = (int32_t)(nextFrameUs - micros());
+  if (wait > 0) {
+    if (wait > 1500) vTaskDelay(pdMS_TO_TICKS(wait / 1000));
+    while ((int32_t)(nextFrameUs - micros()) > 0) { }
+  } else if (wait < -(int32_t)FRAME_US) {
+    nextFrameUs = micros();   // fell behind: don't try to catch up in a burst
+  }
 }

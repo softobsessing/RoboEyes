@@ -1,5 +1,11 @@
-// eyes_anim.h - decides where the ball looks, when it blinks, and handles taps.
+// eyes_anim.h - decides where the eyes look, when they blink, and handles taps.
 // Produces an eyes::Scene every frame. Pure C++ so it can run in the PC preview.
+//
+// Smoothness notes:
+//  - Every motion is time-based, so it plays at the same speed at any frame rate.
+//  - Gaze uses a two-stage smoothing filter: each move eases in AND out with a
+//    bell-shaped speed curve (no sudden start), and a new target arriving
+//    mid-move blends in without a jerk.
 #pragma once
 #include <stdint.h>
 #include <math.h>
@@ -17,6 +23,7 @@ struct AnimConfig {
   float homeYaw, homePitch, homeRoll;   // degrees: resting gaze (from the reference art)
   float wander;                     // degrees of gaze wander around home (new target every few s)
   float drift;                      // degrees of slow, continuous floating on top of that
+  float gazeSpeed;                  // 1 = default; lower = slower, silkier eye movement
   uint32_t wipeMs;                  // how long the color inversion takes
   uint32_t autoReturnMs;            // 0 = tap toggles, else revert after this long
   EyeStyle eye;
@@ -35,16 +42,30 @@ struct Spring {
   }
 };
 
+// Two springs in series: velocity rises and falls smoothly (ease-in + ease-out).
+struct Smooth2 {
+  Spring a, b;
+  void reset(float x) { a.x = b.x = x; a.v = b.v = 0; }
+  void step(float target, float omega, float dt) {
+    // sub-step so a long frame (e.g. the first full-screen draw) stays accurate
+    int n = dt > 0.02f ? (int)(dt / 0.02f) + 1 : 1;
+    float h = dt / n;
+    for (int i = 0; i < n; i++) { a.step(target, omega, h); b.step(a.x, omega, h); }
+  }
+  float value() const { return b.x; }
+};
+
 class Animator {
  public:
   void begin(const AnimConfig &cfg, uint32_t seed, uint32_t now) {
     c = cfg;
+    if (c.gazeSpeed <= 0) c.gazeSpeed = 1;
     rng = seed ? seed : 0x9E3779B9u;
-    br.x = c.faceRadius;
-    yaw.x = c.homeYaw * DEG; pitch.x = c.homePitch * DEG; roll.x = c.homeRoll * DEG;
-    tYaw = yaw.x; tPitch = pitch.x; tRoll = roll.x;
+    br.x = c.faceRadius; br.v = 0;
+    goHome();
+    yaw.reset(tYaw); pitch.reset(tPitch); roll.reset(tRoll);
     inverted = false;
-    wipeStart = 0; wiping = false; justFinishedWipe = true;
+    wiping = false; wipeK = 0; wipeDir = 1; prevWipeR = 0; ringOn = false;
     lookStep = -1;
     nextGaze = now + 1500;
     nextBlink = now + 1800;
@@ -60,33 +81,34 @@ class Animator {
     float t = (now - t0) * 0.001f;
 
     if (tapped) onTap(now);
-    if (c.autoReturnMs && inverted && !wiping && now - tapTime > c.autoReturnMs) onTap(now);
+    if (c.autoReturnMs && isInverted() && !wiping && now - tapTime > c.autoReturnMs) onTap(now);
 
     // ---- gaze targets ----
-    float omega = 9.f;
+    float omega = 5.5f;                       // idle: slow, gentle glides
     if (lookStep >= 0) {
-      // quick look-around after a tap
+      // look-around after a tap: a smooth sweep left, then right, then back
       static const float seq[][3] = {   // yaw, pitch, roll (deg)
-        { -38.f,  8.f,  10.f },
-        {  42.f, 22.f, -14.f },
-        { -10.f, -6.f,   4.f },
+        { -36.f,  8.f,  9.f },
+        {  38.f, 20.f, -12.f },
+        {   0.f,  2.f,  0.f },
       };
-      static const uint32_t dur[] = { 240, 280, 240 };
-      const int n = sizeof(dur) / sizeof(dur[0]);
+      static const uint32_t hold[] = { 650, 750, 500 };
+      const int n = sizeof(hold) / sizeof(hold[0]);
+      omega = 8.5f;
       if (lookStep < n) {
         tYaw = seq[lookStep][0] * DEG; tPitch = seq[lookStep][1] * DEG; tRoll = seq[lookStep][2] * DEG;
-        omega = 16.f;
-        if (now - lookStepStart > dur[lookStep]) { lookStep++; lookStepStart = now; }
+        if (now - lookStepStart > (uint32_t)(hold[lookStep] / c.gazeSpeed)) { lookStep++; lookStepStart = now; }
       } else {
         lookStep = -1;
         goHome();
-        nextGaze = now + rand(1400, 2600);
+        nextGaze = now + rand(1800, 3000);
         startBlink(now, false);
       }
     } else if ((int32_t)(now - nextGaze) >= 0) {
       pickIdleGaze();
-      nextGaze = now + rand(1200, 3600);
+      nextGaze = now + rand(1500, 4000);
     }
+    omega *= c.gazeSpeed;
     yaw.step(tYaw, omega, dt);
     pitch.step(tPitch, omega, dt);
     roll.step(tRoll, omega * 0.8f, dt);
@@ -95,7 +117,7 @@ class Animator {
     float fx = c.drift * DEG * (sinf(t * 0.63f + 0.7f) * 0.7f + sinf(t * 1.17f) * 0.3f);
     float fy = c.drift * DEG * (sinf(t * 0.51f) * 0.6f + sinf(t * 0.93f + 2.1f) * 0.4f);
     // face radius only ever bulges outward (tap "boing"), so the rim never shows
-    br.step(c.faceRadius, 10.f, dt);
+    br.step(c.faceRadius, 9.f, dt);
     if (br.x < c.faceRadius) { br.x = c.faceRadius; if (br.v < 0) br.v = 0; }
 
     // ---- blinking (both eyes together) ----
@@ -103,60 +125,71 @@ class Animator {
     float open = 1.f;
     if (blinkStart && (int32_t)(now - blinkStart) >= 0) {
       uint32_t bt = now - blinkStart;
-      const uint32_t CLOSE = 70, HOLD = 50, OPEN = 120;
+      const uint32_t CLOSE = 90, HOLD = 40, OPEN = 150;
       if (bt < CLOSE) open = 1.f - ease(bt / (float)CLOSE);
       else if (bt < CLOSE + HOLD) open = 0.f;
       else if (bt < CLOSE + HOLD + OPEN) open = ease((bt - CLOSE - HOLD) / (float)OPEN);
-      else if (--blinksLeft > 0) blinkStart = now + 90;   // double blink after a short gap
+      else if (--blinksLeft > 0) blinkStart = now + 110;   // double blink after a short gap
       else { blinkStart = 0; nextBlink = now + rand(2500, 6000); }
     }
 
-    // ---- color wipe ----
+    // ---- color wipe (circle from the center; reverses if tapped mid-way) ----
+    const float endR = c.screenSize * 0.5f + 3.f;   // just past the visible edge
     float wipeR = 0.f;
-    justFinishedWipe = false;
+    ringOn = false;
     if (wiping) {
-      float k = (now - wipeStart) / (float)c.wipeMs;
-      if (k >= 1.f) {
+      wipeK += wipeDir * dt * 1000.f / (float)c.wipeMs;
+      if (wipeK >= 1.f) {                 // finished: inverted colors everywhere
+        wiping = false; inverted = !inverted;
+        ringOn = true; ringR0 = prevWipeR - 2.f; ringR1 = 1e6f;
+      } else if (wipeK <= 0.f) {          // reversed all the way back
         wiping = false;
-        inverted = wipeToInverted;
-        justFinishedWipe = true;
+        ringOn = true; ringR0 = 0.f; ringR1 = prevWipeR + 2.f;
       } else {
-        float e = 1.f - (1.f - k) * (1.f - k) * (1.f - k);   // ease-out
-        wipeR = 1.f + e * wipeMaxR;
+        wipeR = endR * (0.5f - 0.5f * cosf(wipeK * 3.14159265f));   // ease in + out
+        ringOn = true;
+        ringR0 = fminf(prevWipeR, wipeR) - 2.f;
+        ringR1 = fmaxf(prevWipeR, wipeR) + 2.f;
+        prevWipeR = wipeR;
       }
+      if (!wiping) prevWipeR = 0.f;
     }
 
     // ---- fill the scene ----
     float half = c.screenSize * 0.5f;
     s.ballX = half; s.ballY = half; s.ballR = br.x;
-    s.yaw = yaw.x + fx; s.pitch = pitch.x + fy; s.roll = roll.x;
+    s.yaw = yaw.value() + fx; s.pitch = pitch.value() + fy; s.roll = roll.value();
     s.blink = open;
-    bool baseInv = inverted;
-    setPalette(baseInv, s.bgA, s.fgA);
-    setPalette(wiping ? wipeToInverted : baseInv, s.bgB, s.fgB);
-    s.wipeX = wipeX; s.wipeY = wipeY; s.wipeR = wiping ? wipeR : 0.f;
+    setPalette(inverted, s.bgA, s.fgA);
+    setPalette(!inverted, s.bgB, s.fgB);
+    s.wipeX = half; s.wipeY = half;
+    s.wipeR = wiping ? fmaxf(wipeR, 0.001f) : 0.f;
     s.eye = c.eye;
   }
 
   const Scene &scene() const { return s; }
-  // True while the background is changing: the whole screen must be redrawn.
-  bool needsFullRedraw() const { return wiping || justFinishedWipe; }
-  bool isInverted() const { return wiping ? wipeToInverted : inverted; }
+
+  // The ring of the wipe that changed this frame (screen-centered), if any.
+  bool wipeRing(float &r0, float &r1) const { r0 = ringR0; r1 = ringR1; return ringOn; }
+
+  // Where the colors are heading (true = tapped colors).
+  bool isInverted() const { return wiping ? (wipeDir > 0 ? !inverted : inverted) : inverted; }
 
  private:
   AnimConfig c;
   Scene s;
-  Spring br, yaw, pitch, roll;
-  float tYaw, tPitch, tRoll;
-  bool inverted, wiping, wipeToInverted, justFinishedWipe;
-  uint32_t wipeStart, tapTime = 0;
-  float wipeX = 0, wipeY = 0, wipeMaxR = 0;
-  int lookStep;
+  Spring br;
+  Smooth2 yaw, pitch, roll;
+  float tYaw = 0, tPitch = 0, tRoll = 0;
+  bool inverted = false, wiping = false, ringOn = false;
+  float wipeK = 0, wipeDir = 1, prevWipeR = 0, ringR0 = 0, ringR1 = 0;
+  uint32_t tapTime = 0;
+  int lookStep = -1;
   uint32_t lookStepStart = 0;
-  uint32_t nextGaze, nextBlink, blinkStart;
-  int blinksLeft;
-  uint32_t t0, last;
-  uint32_t rng;
+  uint32_t nextGaze = 0, nextBlink = 0, blinkStart = 0;
+  int blinksLeft = 0;
+  uint32_t t0 = 0, last = 0;
+  uint32_t rng = 1;
 
   uint32_t next() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
   uint32_t rand(uint32_t lo, uint32_t hi) { return lo + next() % (hi - lo + 1); }
@@ -193,23 +226,14 @@ class Animator {
 
   void onTap(uint32_t now) {
     tapTime = now;
-    if (wiping) inverted = wipeToInverted;     // finish any wipe in progress instantly
-    wipeToInverted = !inverted;
-    wiping = true;
-    wipeStart = now;
-    // wipe grows from the screen center until it covers the farthest corner
-    wipeX = wipeY = c.screenSize * 0.5f;
-    float W = (float)c.screenSize, mx = 0;
-    const float cx[4] = { 0, W, 0, W }, cy[4] = { 0, 0, W, W };
-    for (int i = 0; i < 4; i++) {
-      float dx = cx[i] - wipeX, dy = cy[i] - wipeY, d = sqrtf(dx * dx + dy * dy);
-      if (d > mx) mx = d;
-    }
-    wipeMaxR = mx + 2.f;
+    if (wiping) wipeDir = -wipeDir;       // tapped mid-wipe: run it backwards
+    else { wiping = true; wipeK = 0; wipeDir = 1; prevWipeR = 0; }
     // look around, with a little "boing"
     lookStep = 0; lookStepStart = now;
-    br.v += 300.f;
-    blinkStart = 0; blinksLeft = 0;
+    br.v += 140.f;
+    // let a blink that's already happening finish smoothly (snapping the
+    // eyes open would be a visible pop); just skip any double blink
+    if (blinkStart) blinksLeft = 1;
     nextBlink = now + 4000;   // the look-around ends with its own blink
   }
 };

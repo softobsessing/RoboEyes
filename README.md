@@ -43,11 +43,14 @@ Everything you're likely to change is at the top of `RoboEyes.ino`:
 | `FACE_RADIUS` | Size of the ball the eyes sit on (236 = fills the screen; bigger = bigger eyes) |
 | `HOME_YAW`, `HOME_PITCH`, `HOME_ROLL` | Resting gaze direction (default: up and to the right, like the reference art) |
 | `GAZE_WANDER`, `GAZE_DRIFT` | How much the eyes look around / float while idle |
+| `GAZE_SPEED` | Eye movement speed (`1.0` default; lower = slower and silkier) |
 | `EYE_SPACING`, `EYE_HEIGHT`, `EYE_WIDTH`, `EYE_LENGTH`, `EYE_TILT` | Eye shape and placement |
 | `WIPE_MS` | Speed of the white/black inversion |
 | `AUTO_RETURN_MS` | `0` = tap toggles; otherwise return to white after N ms |
 | `SCREEN_ROTATION` | Turns the picture clockwise: `0`, `90` (default), `180`, `270` |
 | `BRIGHTNESS` | `0`–`255` |
+| `TARGET_FPS` | Frame-rate cap (default 60) |
+| `SHOW_FPS` | `1` = print frames per second to the Serial Monitor (115200 baud) |
 
 ### Previewing on a computer
 
@@ -59,6 +62,18 @@ clang++ -O2 -std=c++17 -o preview extras/preview/preview.cpp
 ```
 
 (The preview uses its own copy of the settings at the top of `preview.cpp`.)
+
+## How it stays smooth
+
+Every frame is generated live, so smoothness comes down to frames per second and how far the eyes move between frames:
+
+- **Only changed pixels are redrawn.** The face is one solid color, so each frame redraws just the area around each eye. During the color switch it adds only the thin ring the wipe circle grew through since the last frame (`eyes_dirty.h`).
+- **The 3D math is limited to a tight box around each eye**, traced from the pill's outline.
+- **Both CPU cores draw**, and DMA sends one strip to the panel while the next is drawn.
+- **Touch is read on a background task**, so it can never delay a frame.
+- **Motion eases in and out.** Eye movement goes through two smoothing stages, so speed rises and falls gently, and a new target mid-move blends in without a jerk.
+
+Open the Serial Monitor at 115200 baud to see the live frame rate.
 
 ## Hardware pins
 

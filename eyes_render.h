@@ -1,4 +1,4 @@
-// eyes_render.h - draws the "ball with two pill eyes" character.
+// eyes_render.h - draws the two pill eyes on a 3D ball.
 //
 // The ball is treated as a real 3D sphere. The two pill-shaped eyes are
 // painted on its front face, and the whole sphere is rotated (yaw / pitch /
@@ -13,10 +13,22 @@
 #include <stdint.h>
 #include <math.h>
 
+// This is the hot loop: build it with full optimization even though Arduino
+// compiles sketches with -Os.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize("O2", "fast-math")
+#endif
+
+#ifndef EYES_COUNT_3D_PIXEL
+#define EYES_COUNT_3D_PIXEL()   // hook for the PC benchmark
+#endif
+
 namespace eyes {
 
 struct Color { float r, g, b; };
-struct Rect { int x0, y0, x1, y1; };   // inclusive pixel rectangle
+struct Rect { int x0, y0, x1, y1; };   // inclusive pixel rectangle; empty if x1 < x0
+struct Box { float x0, y0, x1, y1; };  // float rectangle in logical (scene) pixels
 
 static inline Color hexColor(uint32_t c) {
   return { float((c >> 16) & 0xFF), float((c >> 8) & 0xFF), float(c & 0xFF) };
@@ -36,8 +48,8 @@ struct Scene {
   float ballX, ballY, ballR;   // ball center / radius in screen pixels
   float yaw, pitch, roll;      // radians: + yaw = look right, + pitch = look up, + roll = clockwise
   float blink;                 // 1 = open, 0 = shut
-  Color bgA, fgA;              // background / ball color outside the wipe circle
-  Color bgB, fgB;              // background / ball color inside the wipe circle
+  Color bgA, fgA;              // eye / face color outside the wipe circle
+  Color bgB, fgB;              // eye / face color inside the wipe circle
   float wipeX, wipeY, wipeR;   // wipe circle; wipeR <= 0 means no wipe
   EyeStyle eye;
 };
@@ -62,11 +74,21 @@ struct Prepared {
   float ct, st;                      // pill tilt
   float invR;
   float r2in, r2out;                 // (R-1)^2, (R+1)^2
-  bool  eyesVisible;
-  float eyeBX[2], eyeBY[2], eyeBR2[2];   // screen-space bounding circles of the pills
   float openLen;                     // half-extent left open by the eyelids
+  bool  eyeOn[2];                    // eye faces the viewer
+  Box   eyeBox[2];                   // tight logical-pixel bounds of each eye (incl. anti-aliasing)
   uint16_t bgA565, fgA565, bgB565, fgB565;
 };
+
+// face (u,v on the ball's front) -> screen offset from ball center, in ball radii
+static inline void faceToScreen(const Prepared &p, float fu, float fv, float &x, float &y, float &z) {
+  float u = fu * p.cr - fv * p.sr;               // apply roll
+  float v = fu * p.sr + fv * p.cr;
+  float w = sqrtf(fmaxf(0.f, 1.f - u * u - v * v));
+  x = p.m00 * u + p.m10 * v + p.m20 * w;         // rotate: screen = M^T * local
+  y =             p.m11 * v + p.m21 * w;
+  z = p.m02 * u + p.m12 * v + p.m22 * w;
+}
 
 static inline void prepare(const Scene &s, Prepared &p) {
   float cy = cosf(s.yaw), sy = sinf(s.yaw);
@@ -86,23 +108,31 @@ static inline void prepare(const Scene &s, Prepared &p) {
   float minOpen = 2.4f / s.ballR;
   p.openLen = fmaxf(clamp01(s.blink) * fullLen, minOpen);
 
-  // Project each eye center to the screen to get a bounding circle.
-  p.eyesVisible = false;
-  float bound = (fullLen * 1.2f) * s.ballR + 3.0f;
-  for (int i = 0; i < 2; i++) {
-    float fu = (i == 0 ? -1.f : 1.f) * s.eye.spacing, fv = s.eye.height;
-    // face -> local (apply roll)
-    float u = fu * p.cr - fv * p.sr;
-    float v = fu * p.sr + fv * p.cr;
-    float w = sqrtf(fmaxf(0.f, 1.f - u * u - v * v));
-    // local -> screen = M^T * local
-    float x = p.m00 * u + p.m10 * v + p.m20 * w;
-    float y =             p.m11 * v + p.m21 * w;
-    float z = p.m02 * u + p.m12 * v + p.m22 * w;
-    p.eyeBX[i] = s.ballX + x * s.ballR;
-    p.eyeBY[i] = s.ballY + y * s.ballR;
-    p.eyeBR2[i] = bound * bound;
-    if (z > -0.35f) p.eyesVisible = true;
+  // Tight screen bounds: trace the rectangle that encloses the (lidded) pill,
+  // project it onto the screen, and take the min/max.
+  const float A = fminf(p.openLen, fullLen), B = s.eye.radius;
+  const int K = 6;   // samples per side
+  for (int e = 0; e < 2; e++) {
+    float side = e == 0 ? -1.f : 1.f, st = p.st * side;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, zmax = -2.f;
+    for (int k = 0; k <= K; k++) {
+      float t = -1.f + 2.f * k / K;
+      const float pts[4][2] = { { -B, t * A }, { B, t * A }, { t * B, -A }, { t * B, A } };
+      for (int q = 0; q < 4; q++) {
+        float b = pts[q][0], a = pts[q][1];
+        float fu = b * p.ct + a * st + side * s.eye.spacing;   // pill axes -> face
+        float fv = -b * st + a * p.ct + s.eye.height;
+        float x, y, z;
+        faceToScreen(p, fu, fv, x, y, z);
+        x0 = fminf(x0, x); x1 = fmaxf(x1, x);
+        y0 = fminf(y0, y); y1 = fmaxf(y1, y);
+        zmax = fmaxf(zmax, z);
+      }
+    }
+    const float m = 3.f;   // anti-aliasing + curvature between samples
+    p.eyeOn[e] = zmax > 0.f;
+    p.eyeBox[e] = { s.ballX + x0 * s.ballR - m, s.ballY + y0 * s.ballR - m,
+                    s.ballX + x1 * s.ballR + m, s.ballY + y1 * s.ballR + m };
   }
 
   p.bgA565 = pack565(s.bgA.r, s.bgA.g, s.bgA.b);
@@ -111,16 +141,11 @@ static inline void prepare(const Scene &s, Prepared &p) {
   p.fgB565 = pack565(s.fgB.r, s.fgB.g, s.fgB.b);
 }
 
-// Logical-space bounding box of both eyes (empty rect if they face away).
-static inline Rect eyeBounds(const Prepared &p) {
-  if (!p.eyesVisible) return { 0, 0, -1, -1 };
-  float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-  for (int i = 0; i < 2; i++) {
-    float r = sqrtf(p.eyeBR2[i]);
-    x0 = fminf(x0, p.eyeBX[i] - r); x1 = fmaxf(x1, p.eyeBX[i] + r);
-    y0 = fminf(y0, p.eyeBY[i] - r); y1 = fmaxf(y1, p.eyeBY[i] + r);
-  }
-  return { (int)floorf(x0), (int)floorf(y0), (int)ceilf(x1), (int)ceilf(y1) };
+// Logical-pixel rect covering one eye (empty if it faces away).
+static inline Rect eyeRect(const Prepared &p, int e) {
+  if (!p.eyeOn[e]) return { 0, 0, -1, -1 };
+  const Box &b = p.eyeBox[e];
+  return { (int)floorf(b.x0), (int)floorf(b.y0), (int)ceilf(b.x1), (int)ceilf(b.y1) };
 }
 
 // Signed distance (in face units) to one pill eye, including eyelids.
@@ -138,8 +163,9 @@ static inline float pillDist(const Scene &s, const Prepared &p, float fu, float 
   return d > lid ? d : lid;
 }
 
-// Coverage (0..1) of the eye holes at a pixel inside the ball.
-static inline float eyeHoleCoverage(const Scene &s, const Prepared &p, float dx, float dy) {
+// Coverage (0..1) of the eye holes at a pixel. mask: bit0 = left eye, bit1 = right eye.
+static inline float eyeHoleCoverage(const Scene &s, const Prepared &p, float dx, float dy, int mask) {
+  EYES_COUNT_3D_PIXEL();
   float nx = dx * p.invR, ny = dy * p.invR;
   float nz2 = 1.f - nx * nx - ny * ny;
   float nz = nz2 > 0 ? sqrtf(nz2) : 0.f;
@@ -150,7 +176,9 @@ static inline float eyeHoleCoverage(const Scene &s, const Prepared &p, float dx,
   // local -> face (undo roll)
   float fu =  lx * p.cr + ly * p.sr;
   float fv = -lx * p.sr + ly * p.cr;
-  float d = fminf(pillDist(s, p, fu, fv, -1.f), pillDist(s, p, fu, fv, 1.f));
+  float d = 1e9f;
+  if (mask & 1) d = pillDist(s, p, fu, fv, -1.f);
+  if (mask & 2) d = fminf(d, pillDist(s, p, fu, fv, 1.f));
   // face units -> screen pixels (foreshortening makes things smaller near the rim)
   float k = nz / lz; k = k < 0.15f ? 0.15f : (k > 1.f ? 1.f : k);
   return clamp01(0.5f - d * s.ballR * k);
@@ -193,6 +221,8 @@ static inline void renderRect(const Scene &s, const Prepared &p, const Xform &xf
   const bool wiping = s.wipeR > 0.f;
   const float wIn = wiping ? (s.wipeR > 1 ? (s.wipeR - 1) * (s.wipeR - 1) : 0.f) : 0.f;
   const float wOut = (s.wipeR + 1) * (s.wipeR + 1);
+  const Box b0 = p.eyeBox[0], b1 = p.eyeBox[1];
+  const bool on0 = p.eyeOn[0], on1 = p.eyeOn[1];
 
   for (int j = 0; j < h; j++) {
     uint16_t *row = buf + j * w;
@@ -216,14 +246,10 @@ static inline void renderRect(const Scene &s, const Prepared &p, const Xform &xf
       if (d2 >= p.r2out) alpha = 0.f;
       else {
         alpha = (d2 <= p.r2in) ? 1.f : clamp01(s.ballR - sqrtf(d2) + 0.5f);
-        if (p.eyesVisible) {
-          bool near = false;
-          for (int e = 0; e < 2; e++) {
-            float ex = px - p.eyeBX[e], ey = py - p.eyeBY[e];
-            if (ex * ex + ey * ey < p.eyeBR2[e]) { near = true; break; }
-          }
-          if (near) alpha *= 1.f - eyeHoleCoverage(s, p, dx, dy);
-        }
+        int mask = 0;
+        if (on0 && px >= b0.x0 && px <= b0.x1 && py >= b0.y0 && py <= b0.y1) mask |= 1;
+        if (on1 && px >= b1.x0 && px <= b1.x1 && py >= b1.y0 && py <= b1.y1) mask |= 2;
+        if (mask) alpha *= 1.f - eyeHoleCoverage(s, p, dx, dy, mask);
       }
 
       // fast paths: solid colors
@@ -246,3 +272,7 @@ static inline void renderRect(const Scene &s, const Prepared &p, const Xform &xf
 }
 
 }  // namespace eyes
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif

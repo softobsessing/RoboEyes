@@ -19,7 +19,7 @@ int main(int argc, char **argv) {
   // keep in sync with the settings at the top of RoboEyes.ino
   c.idleFace = 0xFFFFFF; c.idleEyes = 0x000000; c.tapFace = 0x0B0B0E; c.tapEyes = 0xF4F4F4;
   c.faceRadius = 236; c.homeYaw = 28; c.homePitch = 27; c.homeRoll = -10;
-  c.wander = 10; c.drift = 4; c.wipeMs = 550; c.autoReturnMs = 0;
+  c.wander = 10; c.drift = 4; c.gazeSpeed = 1; c.wipeMs = 650; c.autoReturnMs = 0;
   c.eye = { 0.25f, 0.0f, 0.10f, 0.11f, 0.0f }; c.screenSize = N;
   Animator a; a.begin(c, 12345, 1);
 
