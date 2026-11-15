@@ -5,15 +5,16 @@
  * The round screen itself is the character's face: it's rendered as a 3D ball
  * exactly the size of the display, so only the eyes are drawn on it.
  *
- * - Idle: white face, black eyes. Both eyes blink together and glide around.
- * - Tap: the eyes look around and the face inverts with a circular wipe
- *   (black face, white eyes).
- * - Tap again: back to white. (Or set AUTO_RETURN_MS to revert by itself.)
+ * - On its own: white face, black eyes (or your colors). Both eyes blink
+ *   together and glide around.
+ * - Touch: the face and eye colors swap with a circular wipe and the eyes
+ *   smile (while your finger is down, plus 2.5 s after it lifts). Then the
+ *   usual pill eyes come back; the swapped colors stay.
  *
- * Website control: https://softobsessing.github.io/doomscroll-eyes/ connects
- * over USB or Bluetooth ("EyeBuddy") and picks the mood (neutral / happy /
- * side-eye / disappointed) and where the eyes look. Its live preview runs the
- * same eye code, so the website and the board show the same thing.
+ * Web app: https://softobsessing.github.io/RoboEyes/ connects over USB or
+ * Bluetooth ("RoboEyes-XXXX") to pick the face and eye colors live and save
+ * them. The board remembers its colors when switched off. It only talks to
+ * the RoboEyes app; the doomscroll-eyes (EyeBuddy) app won't drive it.
  *
  * Every frame is generated live, so smoothness = frames per second. To keep
  * that high, only the pixels that changed are redrawn, both CPU cores share
@@ -31,6 +32,8 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
+#include <esp_mac.h>
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
@@ -47,11 +50,9 @@
 //  LOOK & FEEL - tweak these
 // =====================================================================
 
-// Colors as 0xRRGGBB
-#define IDLE_FACE         0xFFFFFF   // before tapping: white screen...
-#define IDLE_EYES         0x000000   // ...black eyes
-#define TAP_FACE          0x0B0B0E   // after tapping: black screen...
-#define TAP_EYES          0xF4F4F4   // ...white eyes
+// Starting colors as 0xRRGGBB (the web app can change them; the board remembers)
+#define DEFAULT_FACE      0xFFFFFF   // white screen...
+#define DEFAULT_EYES      0x000000   // ...black eyes
 
 // Size of the 3D ball the eyes sit on. 236 = just past the 233 px screen
 // radius, so the ball's edge is the screen's edge. Bigger = bigger eyes that
@@ -66,8 +67,8 @@
 #define GAZE_WANDER       10         // degrees the gaze wanders around while idle
 #define GAZE_DRIFT        4          // degrees of slow continuous floating
 #define GAZE_SPEED        1.0f       // eye movement speed: lower = slower and silkier
-#define WIPE_MS           650        // speed of the white/black inversion
-#define AUTO_RETURN_MS    0          // 0 = tap toggles; else go back to white after N ms
+#define WIPE_MS           650        // speed of the color swap when touched
+#define SMILE_MS          2500       // the touch smile lasts this long after the finger lifts
 
 // Eye shape, in fractions of the ball radius
 #define EYE_SPACING       0.25f      // half the distance between the eyes
@@ -81,8 +82,10 @@
 #define TARGET_FPS        60         // frame-rate cap
 #define SHOW_FPS          1          // every 10 s print "D fps ..." to the Serial Monitor
 
-// Website link. Keep BLE_NAME = "EyeBuddy": that's the name the website looks for.
-#define BLE_NAME          "EyeBuddy"
+// Web app link. Bluetooth name = BLE_NAME-<board ID>, e.g. "RoboEyes-3F2A"; keep "RoboEyes",
+// that's what the RoboEyes web app looks for.
+#define BLE_NAME          "RoboEyes"
+#define FW_VERSION        2          // shown in the web app
 #define FOLLOW_YAW        40         // degrees the eyes turn when the website looks fully left/right
 #define FOLLOW_PITCH      30         // degrees the eyes turn when the website looks fully up/down
 #define LINK_TIMEOUT_MS   3000       // no message from the website this long = back to standalone
@@ -292,15 +295,23 @@ static void pushRect(const eyes::Scene &s, const eyes::Prepared &p, const eyes::
 }
 
 // =====================================================================
-//  Website link (same text protocol over USB serial and Bluetooth)
-//   website -> board   E <neutral|happy|side|sad> <lookX -100..100> <lookY -100..100>   (~20/s)
-//                      B | B2          blink now / double blink (the website is the blink clock)
-//                      P               ping
-//   board -> website   HELLO RoboEyes 1
-//                      T touch | T release
-//                      C light | C dark     colors (sent on HELLO and whenever a tap flips them)
-//                      D fps <n> draw_ms <n>   (USB only, every 10 s; the website ignores it)
+//  Web app link (same text protocol over USB serial and Bluetooth)
+//   app -> board   P                       hello? (sent on connect)
+//                  K <face RRGGBB> <eyes RRGGBB>   set the colors now (dragging the color wheel)
+//                  TAP                     do what a touch does (swap colors + smile)
+//                  E <neutral|happy|side|sad> <lookX -100..100> <lookY -100..100>   drive mood + gaze
+//                  B | B2                  blink now / double blink (only while E lines keep coming)
+//   board -> app   HELLO RoboEyes <protocol> <board ID> <firmware>   e.g. "HELLO RoboEyes 2 3F2A 2"
+//                  C <face RRGGBB> <eyes RRGGBB>   current colors (after HELLO and after every swap)
+//                  T touch | T release
+//                  D fps <n> draw_ms <n>   (USB only, every 10 s; the app ignores it)
 // =====================================================================
+#define PROTOCOL 2
+static char boardId[8] = "0000";
+static Preferences prefs;   // NVS "roboeyes": the colors, so they survive power-off
+static uint32_t savedFace, savedEyes, colorsChangedAt = 0;
+static bool colorsDirty = false;
+
 static bool haveLink = false;
 static uint32_t lastLinkMs = 0;
 static eyes::Mood linkMood = eyes::NEUTRAL;
@@ -311,14 +322,56 @@ static void emit(const char *line) {
   ble_send_line(line);
 }
 
-static void emitColors() { emit(anim.isInverted() ? "C dark" : "C light"); }
+static void emitHello() {
+  char line[48];
+  snprintf(line, sizeof line, "HELLO RoboEyes %d %s %d", PROTOCOL, boardId, FW_VERSION);
+  emit(line);
+}
+
+static void emitColors() {
+  char line[24];
+  snprintf(line, sizeof line, "C %06lX %06lX", (unsigned long)anim.faceColor(), (unsigned long)anim.eyeColor());
+  emit(line);
+}
+
+// Save 1.5 s after the last change, so dragging the color wheel doesn't wear out the flash.
+static void saveColorsWhenSettled(uint32_t now) {
+  uint32_t f = anim.faceColor(), e = anim.eyeColor();
+  if (f != savedFace || e != savedEyes) {
+    savedFace = f; savedEyes = e;
+    colorsChangedAt = now;
+    colorsDirty = true;
+  }
+  if (colorsDirty && now - colorsChangedAt > 1500) {
+    prefs.putUInt("face", savedFace);
+    prefs.putUInt("eyes", savedEyes);
+    colorsDirty = false;
+  }
+}
+
+// A finger down / up on the screen (or the web app's TAP).
+static void onTouch(bool down, uint32_t now) {
+  anim.touch(down, now);
+  emit(down ? "T touch" : "T release");
+  if (down) emitColors();   // the colors it's swapping to
+}
 
 static bool linked(uint32_t now) { return haveLink && now - lastLinkMs < LINK_TIMEOUT_MS; }
 
 static void onLine(const char *line, uint32_t now) {
   if (line[0] == 'P' && line[1] == 0) {
-    emit("HELLO RoboEyes 1");
+    emitHello();
     emitColors();
+    return;
+  }
+  unsigned face = 0, eyes = 0;
+  if (line[0] == 'K' && sscanf(line, "K %6x %6x", &face, &eyes) == 2) {
+    anim.setColors(face, eyes);
+    return;
+  }
+  if (strcmp(line, "TAP") == 0) {
+    onTouch(true, now);
+    onTouch(false, now);
     return;
   }
   if (line[0] == 'B' && (line[1] == 0 || (line[1] == '2' && line[2] == 0))) {
@@ -376,8 +429,11 @@ void setup() {
   xTaskCreatePinnedToCore(renderWorker, "render", 4096, nullptr, 3, &workerHandle, 0);
 
   eyes::AnimConfig cfg;
-  cfg.idleFace = IDLE_FACE;  cfg.idleEyes = IDLE_EYES;
-  cfg.tapFace = TAP_FACE;    cfg.tapEyes = TAP_EYES;
+  prefs.begin("roboeyes", false);
+  savedFace = prefs.getUInt("face", DEFAULT_FACE) & 0xFFFFFF;
+  savedEyes = prefs.getUInt("eyes", DEFAULT_EYES) & 0xFFFFFF;
+  cfg.face = savedFace;
+  cfg.eyes = savedEyes;
   cfg.faceRadius = FACE_RADIUS;
   cfg.homeYaw = HOME_YAW; cfg.homePitch = HOME_PITCH; cfg.homeRoll = HOME_ROLL;
   cfg.wander = GAZE_WANDER;
@@ -386,7 +442,7 @@ void setup() {
   cfg.followYaw = FOLLOW_YAW;
   cfg.followPitch = FOLLOW_PITCH;
   cfg.wipeMs = WIPE_MS;
-  cfg.autoReturnMs = AUTO_RETURN_MS;
+  cfg.smileMs = SMILE_MS;
   cfg.eye.spacing = EYE_SPACING;
   cfg.eye.height = EYE_HEIGHT;
   cfg.eye.radius = EYE_WIDTH * 0.5f;
@@ -396,8 +452,15 @@ void setup() {
   anim.begin(cfg, esp_random(), millis());
   xform = eyes::makeXform(SCREEN_ROTATION, LCD_SIZE);
   dirty.begin(SCREEN_ROTATION, LCD_SIZE);
-  ble_begin(BLE_NAME);
-  emit("HELLO RoboEyes 1");
+
+  // This board's ID: last 2 bytes of its factory MAC address, e.g. "3F2A" -> Bluetooth "RoboEyes-3F2A".
+  uint8_t mac[6] = {0};
+  esp_efuse_mac_get_default(mac);
+  snprintf(boardId, sizeof boardId, "%02X%02X", mac[4], mac[5]);
+  char name[24];
+  snprintf(name, sizeof name, "%s-%s", BLE_NAME, boardId);
+  ble_begin(name);
+  emitHello();
   emitColors();
 }
 
@@ -408,14 +471,9 @@ void loop() {
 
   uint32_t now = millis();
 
-  // touch: a tap looks around and flips the colors; tell the website so its preview follows
-  if (touchDownPending) {
-    touchDownPending = false;
-    anim.tap(now);
-    emit("T touch");
-    emitColors();
-  }
-  if (touchUpPending) { touchUpPending = false; emit("T release"); }
+  // touch: swap the colors + smile; tell the web app so its preview and color picker follow
+  if (touchDownPending) { touchDownPending = false; onTouch(true, now); }
+  if (touchUpPending) { touchUpPending = false; onTouch(false, now); }
 
   // the website (if connected) picks the mood, the gaze and when to blink
   pollLinks(now);
@@ -426,6 +484,8 @@ void loop() {
   if (isLinked) anim.setLook(linkX, linkY);
 
   anim.update(now);
+  if (anim.takeRepaint()) dirty.invalidate();   // new colors from the web app: redraw everything
+  saveColorsWhenSettled(now);
   const eyes::Scene &s = anim.scene();
   eyes::Prepared p;
   eyes::prepare(s, p);

@@ -10,16 +10,27 @@
 #define NUS_SERVICE "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define NUS_RX      "6e400002-b5a3-f393-e0a9-e50e24dcca9e"   // laptop -> board
 #define NUS_TX      "6e400003-b5a3-f393-e0a9-e50e24dcca9e"   // board -> laptop
+constexpr size_t CHUNK = 20;                                  // fits the smallest BLE packet (ATT MTU 23)
 
+static BLEServer* server = nullptr;
 static BLECharacteristic* txChar = nullptr;
 static StreamBufferHandle_t rxStream = nullptr;   // BLE task -> loop()
-static volatile bool connected = false;
+static volatile int connections = 0;
+static volatile uint32_t drops = 0;
 
 class ServerEvents : public BLEServerCallbacks {
-  void onConnect(BLEServer*) override { connected = true; }
+  void onConnect(BLEServer* s) override {
+    connections++;
+    // NimBLE stops advertising when someone connects, so a second laptop can't find the board.
+    // Belt and braces: if one slips in anyway, drop all and let the rightful one reconnect.
+    if (connections > 1) {
+      for (auto& p : s->getPeerDevices(false)) s->disconnect(p.first);
+    }
+  }
   void onDisconnect(BLEServer* s) override {
-    connected = false;
-    s->startAdvertising();   // let the web app reconnect
+    if (connections > 0) connections--;
+    drops++;
+    if (connections == 0) s->startAdvertising();   // let the web app reconnect
   }
 };
 
@@ -32,7 +43,7 @@ class RxEvents : public BLECharacteristicCallbacks {
 void ble_begin(const char* name) {
   rxStream = xStreamBufferCreate(1024, 1);
   BLEDevice::init(name);
-  BLEServer* server = BLEDevice::createServer();
+  server = BLEDevice::createServer();
   server->setCallbacks(new ServerEvents());
   BLEService* nus = server->createService(NUS_SERVICE);
   txChar = nus->createCharacteristic(NUS_TX, BLECharacteristic::PROPERTY_NOTIFY);
@@ -51,11 +62,20 @@ void ble_begin(const char* name) {
 size_t ble_read(char* buf, size_t max) { return rxStream ? xStreamBufferReceive(rxStream, buf, max, 0) : 0; }
 
 void ble_send_line(const char* line) {
-  if (!connected || !txChar) return;
+  if (connections <= 0 || !txChar) return;
   String s(line);
   s += '\n';
-  txChar->setValue((uint8_t*)s.c_str(), s.length());
-  txChar->notify();
+  for (size_t off = 0; off < s.length(); off += CHUNK) {   // the web app reassembles lines
+    size_t n = s.length() - off < CHUNK ? s.length() - off : CHUNK;
+    txChar->setValue((uint8_t*)s.c_str() + off, n);
+    txChar->notify();
+  }
 }
 
-bool ble_connected() { return connected; }
+bool ble_connected() { return connections > 0; }
+uint32_t ble_drops() { return drops; }
+
+void ble_disconnect() {
+  if (!server) return;
+  for (auto& p : server->getPeerDevices(false)) server->disconnect(p.first);
+}

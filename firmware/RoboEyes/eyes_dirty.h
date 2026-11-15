@@ -3,6 +3,7 @@
 // The face is one solid color, so normally only the area around each eye
 // (where it was + where it is now) needs redrawing. During the color wipe we
 // also redraw just the ring the wipe circle grew through since last frame.
+// A color change from the web app redraws everything once (invalidate()).
 // Fewer pixels per frame = more frames per second = smoother motion.
 #pragma once
 #include "eyes_render.h"
@@ -48,6 +49,9 @@ class DirtyTracker {
     first = true;
     prev[0] = prev[1] = { 0, 0, -1, -1 };
   }
+
+  // Redraw the whole screen next frame (the colors changed everywhere).
+  void invalidate() { first = true; }
 
   // Fill `out` with the physical, panel-aligned rects to redraw this frame.
   // ringActive/r0/r1: the wipe ring (screen-centered) that changed this frame.

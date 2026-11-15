@@ -1,15 +1,19 @@
 // eyes_anim.h - decides where the eyes look, how they feel, when they blink.
 // Produces an eyes::Scene every frame. Pure C++ so it can run in the PC preview.
 //
-// The website (softobsessing.github.io/doomscroll-eyes) runs a line-for-line
-// JavaScript port of this file + eyes_render.h as its live preview (eyes.js).
-// If you change shapes, moods or timings here, change eyes.js too and run its
-// pixel test (see extras/preview/README in this repo).
+// The RoboEyes web app (roboeyes.js in the root of this repo) runs a
+// line-for-line JavaScript port of this file + eyes_render.h as its live
+// preview. If you change shapes, moods, colors or timings here, change
+// roboeyes.js too and run its pixel test (see the README).
 //
 // Two modes:
 //  - standalone: blinks by itself, glances around a resting pose, floats.
-//  - linked (the website is connected): the website picks the mood and where
-//    to look, and tells the board when to blink, so board and preview match.
+//  - linked (something sends E lines): it picks the mood and where to look,
+//    and tells the board when to blink.
+//
+// Touch: the face and eye colors swap (circular wipe) and the eyes smile while
+// the finger is down plus smileMs after it lifts, then go back to the usual
+// pills. The swapped colors stay.
 //
 // Smoothness notes:
 //  - Every motion is time-based, so it plays at the same speed at any frame rate.
@@ -45,18 +49,20 @@ static const MoodStyle MOOD_STYLES[4] = {
   { 0.34f, 0.85f, 0.00f, -8.f },   // sad ("disappointed"): droopy outer corners, head down
 };
 
+// Where the eyes look while smiling after a touch: at the person who touched it.
+static const float SMILE_YAW = 0.f, SMILE_PITCH = 0.f, SMILE_ROLL = 0.f;   // degrees
+
 // The whole round screen is the ball's face; only the eyes are drawn on it.
 struct AnimConfig {
-  uint32_t idleFace, idleEyes;      // colors before tapping
-  uint32_t tapFace, tapEyes;        // colors after tapping
+  uint32_t face, eyes;              // starting colors (0xRRGGBB); a touch swaps them
   float faceRadius;                 // px; slightly larger than the screen radius
   float homeYaw, homePitch, homeRoll;   // degrees: resting gaze (from the reference art)
   float wander;                     // degrees of gaze wander around home (new target every few s)
   float drift;                      // degrees of slow, continuous floating on top of that
   float gazeSpeed;                  // 1 = default; lower = slower, silkier eye movement
   float followYaw, followPitch;     // degrees the eyes turn for a full-scale website look value
-  uint32_t wipeMs;                  // how long the color inversion takes
-  uint32_t autoReturnMs;            // 0 = tap toggles, else revert after this long
+  uint32_t wipeMs;                  // how long the color swap takes
+  uint32_t smileMs;                 // the touch smile lasts this long after the finger lifts
   EyeStyle eye;
   int screenSize;
 };
@@ -98,9 +104,9 @@ class Animator {
     lidTop.reset(0); lidSlant.reset(0); lidHappy.reset(0); moodPitch.reset(0);
     mood = NEUTRAL; linked = false; autoBlink = true;
     lookX = lookY = 0; jitX = jitY = 0; nextJitter = now;
-    inverted = false;
+    face = toFace = c.face; eyes = toEyes = c.eyes; repaint = false;
     wiping = false; wipeK = 0; wipeDir = 1; prevWipeR = 0; ringOn = false;
-    lookStep = -1;
+    held = false; smileEnd = 0; wasSmiling = false;
     nextGaze = now + 1500;
     nextBlink = now + 1800;
     blinkStart = 0; blinksLeft = 0; blinkEvent = false; blinkEventTwice = false;
@@ -125,24 +131,36 @@ class Animator {
     startBlink(now, twice ? 2 : 1);
     return true;
   }
-  // The look-around that plays when the screen is tapped.
-  void lookAround(uint32_t now) {
-    lookStep = 0; lookStepStart = now;
-    br.v += 140.f;   // a little "boing"
-    // let a blink that's already happening finish smoothly (snapping the
-    // eyes open would be a visible pop); just skip any double blink
-    if (blinkStart) blinksLeft = 1;
-    nextBlink = now + 4000;   // the look-around ends with its own blink
+  // New colors right away (the web app's color wheel). Same colors = nothing to do,
+  // so an echo of what we already show never cuts a swap short.
+  void setColors(uint32_t newFace, uint32_t newEyes) {
+    newFace &= 0xFFFFFF; newEyes &= 0xFFFFFF;
+    if (newFace == faceColor() && newEyes == eyeColor()) return;
+    face = toFace = newFace; eyes = toEyes = newEyes;
+    wiping = false; prevWipeR = 0;
+    repaint = true;
   }
-  // Animate the circular color wipe toward the tapped (true) or idle (false) colors.
-  void setInverted(bool inv, uint32_t now) {
-    if (inv == isInverted()) return;
-    tapTime = now;
-    if (wiping) wipeDir = -wipeDir;       // changed mind mid-wipe: run it backwards
-    else { wiping = true; wipeK = 0; wipeDir = 1; prevWipeR = 0; }
+  // Swap the face and eye colors with a circular wipe (runs backwards if swapped again mid-way).
+  void swapColors() {
+    if (wiping) { wipeDir = -wipeDir; return; }
+    toFace = eyes; toEyes = face;
+    wiping = true; wipeK = 0; wipeDir = 1; prevWipeR = 0;
   }
-  // What a tap does on the board: look around + flip the colors.
-  void tap(uint32_t now) { lookAround(now); setInverted(!isInverted(), now); }
+  // A finger on the screen (down) or lifted (up): swap colors + smile.
+  void touch(bool down, uint32_t now) {
+    if (down) {
+      swapColors();
+      held = true;
+      br.v += 140.f;   // a little "boing"
+      // let a blink that's already happening finish smoothly (snapping the
+      // eyes open would be a visible pop); just skip any double blink
+      if (blinkStart) blinksLeft = 1;
+      if ((int32_t)(nextBlink - (now + 1500)) < 0) nextBlink = now + 1500;
+    } else if (held) {
+      held = false;
+      smileEnd = (now + c.smileMs) ? now + c.smileMs : 1;
+    }
+  }
 
   // ---------------- per frame ----------------
   void update(uint32_t now) {
@@ -152,7 +170,11 @@ class Animator {
     last = now;
     float t = (now - t0) * 0.001f;
 
-    if (c.autoReturnMs && isInverted() && !wiping && now - tapTime > c.autoReturnMs) setInverted(false, now);
+    // ---- the touch smile ----
+    bool smile = smiling(now);
+    if (!smile) smileEnd = 0;
+    if (wasSmiling && !smile && !linked) { goHome(); nextGaze = now + rand(1800, 3000); }   // back to its usual self
+    wasSmiling = smile;
 
     // ---- small random glances while the website drives the gaze ----
     if (linked && autoBlink) {
@@ -166,39 +188,21 @@ class Animator {
     }
 
     // ---- gaze targets ----
-    float omega = 5.5f;
-    if (lookStep >= 0) {
-      // look-around after a tap: a smooth sweep left, then right, then back
-      static const float seq[][3] = {   // yaw, pitch, roll (deg)
-        { -36.f,  8.f,  9.f },
-        {  38.f, 20.f, -12.f },
-        {   0.f,  2.f,  0.f },
-      };
-      static const uint32_t hold[] = { 650, 750, 500 };
-      const int n = sizeof(hold) / sizeof(hold[0]);
-      omega = 8.5f;
-      if (lookStep < n) {
-        tYaw = seq[lookStep][0] * DEG; tPitch = seq[lookStep][1] * DEG; tRoll = seq[lookStep][2] * DEG;
-        if (now - lookStepStart > (uint32_t)(hold[lookStep] / c.gazeSpeed)) { lookStep++; lookStepStart = now; }
-      } else {
-        lookStep = -1;
-        if (!linked) { goHome(); nextGaze = now + rand(1800, 3000); }
-        if (autoBlink) { startBlink(now, 1); blinkEvent = true; blinkEventTwice = false; }
-      }
-    }
-    if (lookStep < 0) {
-      if (linked) {
-        omega = 11.f;
-        float lx = lookX + jitX, ly = lookY + jitY;
-        tYaw = lx * c.followYaw * DEG;
-        tPitch = -ly * c.followPitch * DEG;
-        tRoll = -lx * 5.f * DEG;
-      } else {
-        omega = 5.5f;   // idle: slow, gentle glides
-        if ((int32_t)(now - nextGaze) >= 0) {
-          pickIdleGaze();
-          nextGaze = now + rand(1500, 4000);
-        }
+    float omega;
+    if (linked) {
+      omega = 11.f;
+      float lx = lookX + jitX, ly = lookY + jitY;
+      tYaw = lx * c.followYaw * DEG;
+      tPitch = -ly * c.followPitch * DEG;
+      tRoll = -lx * 5.f * DEG;
+    } else if (smile) {
+      omega = 8.5f;   // smiling: look at whoever touched it
+      tYaw = SMILE_YAW * DEG; tPitch = SMILE_PITCH * DEG; tRoll = SMILE_ROLL * DEG;
+    } else {
+      omega = 5.5f;   // idle: slow, gentle glides
+      if ((int32_t)(now - nextGaze) >= 0) {
+        pickIdleGaze();
+        nextGaze = now + rand(1500, 4000);
       }
     }
     omega *= c.gazeSpeed;
@@ -207,7 +211,7 @@ class Animator {
     roll.step(tRoll, omega * 0.8f, dt);
 
     // ---- mood eyelids morph smoothly ----
-    const MoodStyle &ms = MOOD_STYLES[mood];
+    const MoodStyle &ms = MOOD_STYLES[smile ? HAPPY : mood];
     lidTop.step(ms.lidTop, 11.f, dt);
     lidSlant.step(ms.lidSlant, 11.f, dt);
     lidHappy.step(ms.lidHappy, 11.f, dt);
@@ -240,16 +244,16 @@ class Animator {
       else { blinkStart = 0; nextBlink = now + rand(2500, 6000); }
     }
 
-    // ---- color wipe (circle from the center; reverses if changed mid-way) ----
+    // ---- color swap wipe (circle from the center; reverses if swapped again mid-way) ----
     const float endR = c.screenSize * 0.5f + 3.f;   // just past the visible edge
     float wipeR = 0.f;
     ringOn = false;
     if (wiping) {
       wipeK += wipeDir * dt * 1000.f / (float)c.wipeMs;
-      if (wipeK >= 1.f) {                 // finished: inverted colors everywhere
-        wiping = false; inverted = !inverted;
+      if (wipeK >= 1.f) {                 // finished: the new colors everywhere
+        wiping = false; face = toFace; eyes = toEyes;
         ringOn = true; ringR0 = prevWipeR - 2.f; ringR1 = 1e6f;
-      } else if (wipeK <= 0.f) {          // reversed all the way back
+      } else if (wipeK <= 0.f && wipeDir < 0) {   // reversed all the way back
         wiping = false;
         ringOn = true; ringR0 = 0.f; ringR1 = prevWipeR + 2.f;
       } else {
@@ -272,8 +276,10 @@ class Animator {
     s.lidTop = lidTop.value();
     s.lidSlant = lidSlant.value();
     s.lidHappy = lidHappy.value();
-    setPalette(inverted, s.bgA, s.fgA);
-    setPalette(!inverted, s.bgB, s.fgB);
+    // renderer terms: fg = the ball (the face), bg = what shows through the eye holes
+    s.fgA = hexColor(face);   s.bgA = hexColor(eyes);       // outside the wipe circle
+    s.fgB = hexColor(wiping ? toFace : face);               // inside it
+    s.bgB = hexColor(wiping ? toEyes : eyes);
     s.wipeX = half; s.wipeY = half;
     s.wipeR = wiping ? fmaxf(wipeR, 0.001f) : 0.f;
     s.eye = c.eye;
@@ -285,8 +291,13 @@ class Animator {
   // The ring of the wipe that changed this frame (screen-centered), if any.
   bool wipeRing(float &r0, float &r1) const { r0 = ringR0; r1 = ringR1; return ringOn; }
 
-  // Where the colors are heading (true = tapped colors).
-  bool isInverted() const { return wiping ? (wipeDir > 0 ? !inverted : inverted) : inverted; }
+  // The colors it shows (or is wiping toward).
+  uint32_t faceColor() const { return wiping && wipeDir > 0 ? toFace : face; }
+  uint32_t eyeColor() const { return wiping && wipeDir > 0 ? toEyes : eyes; }
+  // True once after setColors(): the whole screen changed, redraw all of it.
+  bool takeRepaint() { bool r = repaint; repaint = false; return r; }
+  // Smiling after a touch (finger down, or less than smileMs since it lifted).
+  bool smiling(uint32_t now) const { return held || (smileEnd && (int32_t)(now - smileEnd) < 0); }
 
   // A blink this animator started by itself (so the website can tell the board).
   bool takeBlinkEvent(bool &twice) {
@@ -309,11 +320,11 @@ class Animator {
   bool linked = false, autoBlink = true;
   float lookX = 0, lookY = 0, jitX = 0, jitY = 0;
   uint32_t nextJitter = 0;
-  bool inverted = false, wiping = false, ringOn = false;
+  uint32_t face = 0, eyes = 0, toFace = 0, toEyes = 0;
+  bool repaint = false, wiping = false, ringOn = false;
   float wipeK = 0, wipeDir = 1, prevWipeR = 0, ringR0 = 0, ringR1 = 0;
-  uint32_t tapTime = 0;
-  int lookStep = -1;
-  uint32_t lookStepStart = 0;
+  bool held = false, wasSmiling = false;
+  uint32_t smileEnd = 0;
   uint32_t nextGaze = 0, nextBlink = 0, blinkStart = 0;
   int blinksLeft = 0;
   bool blinkEvent = false, blinkEventTwice = false;
@@ -324,12 +335,6 @@ class Animator {
   uint32_t rand(uint32_t lo, uint32_t hi) { return lo + next() % (hi - lo + 1); }
   float frand(float lo, float hi) { return lo + (hi - lo) * (next() % 10001) / 10000.f; }
   static float ease(float x) { return x * x * (3.f - 2.f * x); }
-
-  // renderer terms: fg = the ball (the face), bg = what shows through the eye holes
-  void setPalette(bool inv, Color &bg, Color &fg) const {
-    bg = hexColor(inv ? c.tapEyes : c.idleEyes);
-    fg = hexColor(inv ? c.tapFace : c.idleFace);
-  }
 
   void goHome() { tYaw = c.homeYaw * DEG; tPitch = c.homePitch * DEG; tRoll = c.homeRoll * DEG; }
 

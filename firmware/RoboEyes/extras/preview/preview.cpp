@@ -1,6 +1,7 @@
 // PC preview: runs the real animation + renderer and writes a contact sheet.
 //   clang++ -O2 -std=c++17 -o preview extras/preview/preview.cpp
-//   ./preview sheet.ppm [tap_ms...]    (frames every 50 ms, default tap at 2000 ms)
+//   ./preview sheet.ppm [touch_ms...]    (frames every 50 ms, default touch at 2000 ms;
+//                                         each touch holds the finger down for 250 ms)
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -10,17 +11,19 @@ using namespace eyes;
 
 int main(int argc, char **argv) {
   const int N = 466, COLS = 8, ROWS = 6, S = 2;     // each tile = 233 px (half size)
-  const int T = N / S, STEP_MS = 50, FIRST_MS = 1700;
+  const int T = N / S;
+  const int STEP_MS = getenv("STEP_MS") ? atoi(getenv("STEP_MS")) : 50;      // e.g. STEP_MS=100 FIRST_MS=3000 ./preview ...
+  const int FIRST_MS = getenv("FIRST_MS") ? atoi(getenv("FIRST_MS")) : 1700;
   std::vector<uint32_t> taps;
   for (int i = 2; i < argc; i++) taps.push_back(atoi(argv[i]));
   if (taps.empty()) taps.push_back(2000);
 
   AnimConfig c;
   // keep in sync with the settings at the top of RoboEyes.ino
-  c.idleFace = 0xFFFFFF; c.idleEyes = 0x000000; c.tapFace = 0x0B0B0E; c.tapEyes = 0xF4F4F4;
+  c.face = 0xFFFFFF; c.eyes = 0x000000;
   c.faceRadius = 236; c.homeYaw = 28; c.homePitch = 27; c.homeRoll = -10;
   c.wander = 10; c.drift = 4; c.gazeSpeed = 1; c.followYaw = 40; c.followPitch = 30;
-  c.wipeMs = 650; c.autoReturnMs = 0;
+  c.wipeMs = 650; c.smileMs = 2500;
   c.eye = { 0.25f, 0.0f, 0.10f, 0.11f, 0.0f }; c.screenSize = N;
   Animator a; a.begin(c, 12345, 1);
 
@@ -29,9 +32,10 @@ int main(int argc, char **argv) {
   Xform xf = makeXform(0, N);
   int tile = 0;
   for (uint32_t t = 1; tile < COLS * ROWS; t += 10) {     // simulate at 100 fps
-    bool tap = false;
-    for (uint32_t tp : taps) if (t <= tp && tp < t + 10) tap = true;
-    if (tap) a.tap(t);
+    for (uint32_t tp : taps) {
+      if (t <= tp && tp < t + 10) a.touch(true, t);
+      if (t <= tp + 250 && tp + 250 < t + 10) a.touch(false, t);
+    }
     a.update(t);
     if (t >= FIRST_MS && (t - FIRST_MS) % STEP_MS < 10) {
       Prepared p; prepare(a.scene(), p);
