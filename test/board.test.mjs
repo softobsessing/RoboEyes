@@ -1,6 +1,6 @@
 // node test/board.test.mjs — what counts as a RoboEyes board, and the color lines.
 import assert from 'node:assert';
-import { parseHello, parseColors, colorsLine, idFromName, bleName, PROTOCOL } from '../board.js';
+import { parseHello, parseColors, colorsLine, idFromName, bleName, PROTOCOL, parseMode, parseFollow, followLine, parseHearts } from '../board.js';
 
 let n = 0;
 const t = (name, fn) => { fn(); n++; console.log(`ok  ${name}`); };
@@ -37,5 +37,24 @@ t('Bluetooth names', () => {
   assert.strictEqual(bleName('3F2A'), 'RoboEyes-3F2A');
   assert.strictEqual(idFromName('RoboEyes-3f2a'), '3F2A');
   assert.strictEqual(idFromName('EyeBuddy-3F2A'), null);
+});
+t('touch mode lines', () => {
+  assert.strictEqual(parseMode('M swap'), 'swap');
+  assert.strictEqual(parseMode('M follow'), 'follow');
+  assert.strictEqual(parseMode('M dance'), null);
+  assert.strictEqual(parseMode('MOVE'), null);
+});
+t('follow lines both ways', () => {
+  assert.deepStrictEqual(parseFollow('F 12 -40'), { x: 0.12, y: -0.4 });
+  assert.deepStrictEqual(parseFollow('F up'), { up: true });
+  assert.deepStrictEqual(parseFollow('F 250 0'), { x: 1, y: 0 });
+  assert.strictEqual(parseFollow('F fast'), null);
+  assert.strictEqual(followLine(0.123, -0.456), 'F 12 -46');
+  assert.strictEqual(followLine(3, -3), 'F 100 -100');
+});
+t('heart eyes lines', () => {
+  assert.strictEqual(parseHearts('H 1'), true);
+  assert.strictEqual(parseHearts('H 0'), false);
+  assert.strictEqual(parseHearts('HELLO RoboEyes 2 3F2A 4'), null);
 });
 console.log(`\n${n} passed`);

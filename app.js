@@ -1,20 +1,27 @@
 // app.js — the RoboEyes web app: connect to a RoboEyes board (USB or Bluetooth), pick its face
-// and eye colors live, save color pairs, and mirror touches in the preview.
+// and eye colors live, save color pairs, mirror touches in the preview, and (camera on) make it
+// blink when you blink.
 import { SerialLink, BleLink } from './link.js';
-import { Engine, ScreenPreview } from './roboeyes.js';
+import { Engine, ScreenPreview, CONFIG, SCREEN } from './roboeyes.js';
 import { ColorPicker, DEFAULT_COLORS, hex6 } from './colors.js';
-import { PROTOCOL, bleName, colorsLine, parseColors, parseHello } from './board.js';
+import { PROTOCOL, MOVES_FW, bleName, colorsLine, followLine, parseColors, parseFollow, parseHearts, parseHello, parseMode } from './board.js';
+import { BlinkDetector, DEFAULT_SENSITIVITY, sensitivityLabel } from './blink.js';
 
 const $ = (id) => document.getElementById(id);
 const el = {
   pill: $('pill'), btnUsb: $('btnUsb'), btnUsbAny: $('btnUsbAny'), btnBle: $('btnBle'), btnBleAny: $('btnBleAny'),
   linkMsg: $('linkMsg'), toast: $('toast'), btnTap: $('btnTap'), mood: $('mood'), moodSub: $('moodSub'),
   boardCard: $('boardCard'), boardName: $('boardName'), boardMeta: $('boardMeta'),
+  btnCam: $('btnCam'), camBox: $('camBox'), video: $('video'), camMsg: $('camMsg'), blinkFlash: $('blinkFlash'),
+  meterWrap: $('meterWrap'), meterFill: $('meterFill'), meterLine: $('meterLine'),
+  sens: $('sens'), sensLabel: $('sensLabel'), blinkStats: $('blinkStats'),
+  touchMode: $('touchMode'), touchNote: $('touchNote'), movesNote: $('movesNote'),
+  btnDartL: $('btnDartL'), btnDartR: $('btnDartR'), btnShake: $('btnShake'), btnHearts: $('btnHearts'),
 };
 
 // ------------------------------------------------------------------ saved in this browser
 // (the doomscroll-eyes app lives on the same site and uses "eyebuddy.*" keys; these never clash)
-const LS = { colors: 'roboeyes.colors', savedColors: 'roboeyes.savedColors', board: 'roboeyes.board' };
+const LS = { colors: 'roboeyes.colors', savedColors: 'roboeyes.savedColors', board: 'roboeyes.board', blink: 'roboeyes.blink', touchMode: 'roboeyes.touchMode' };
 function loadJSON(key, fallback) {
   try { const v = JSON.parse(localStorage.getItem(key)); return v ?? fallback; } catch { return fallback; }
 }
@@ -77,11 +84,13 @@ for (const l of [usb, ble]) {
     } else if (link === l) {
       clearHelloTimers();
       board = null;
+      if (engine.action === 1 && !dragging) engine.followEnd(nowMs());   // the board's finger is gone
       if (s.state === 'disconnected') link = null;
     }
     if (link === l || !link) renderPill(s);
     renderConnButtons();
     renderBoard();
+    renderBlinkStats();
   });
   l.onLine((line) => handleBoardLine(l, line));
 }
@@ -107,9 +116,18 @@ function handleBoardLine(l, line) {
   if (!board) return;   // nothing else counts until it has said who it is
   const c = parseColors(line);
   if (c) { adoptColors(c); return; }
+  const mode = parseMode(line);
+  if (mode) { setTouchMode(mode, { send: false }); return; }   // the board's own setting wins
+  const hearts = parseHearts(line);
+  if (hearts !== null) { setHearts(hearts, { send: false }); return; }   // what the board is showing
+  const f = parseFollow(line);
+  if (f) {   // a finger on the board: the preview's eyes follow it too
+    if (!dragging) { if (f.up) engine.followEnd(nowMs()); else engine.follow(f.x, f.y, nowMs()); }
+    return;
+  }
   const w = line.trim().split(/\s+/);
   if (w[0] === 'T' && (w[1] === 'touch' || w[1] === 'release')) {
-    engine.touch(w[1] === 'touch', nowMs());   // the preview swaps + smiles along with the board
+    engine.touch(w[1] === 'touch', nowMs());   // the preview swaps along with the board
     return;
   }
   console.debug('[board]', line);   // e.g. "D fps 58.9 draw_ms 9.1"
@@ -143,6 +161,7 @@ async function onHello(l, h) {
   renderPill({ state: l.state, kind: l.kind });
   renderConnButtons();
   renderBoard();
+  renderBlinkStats();
 }
 
 function showLinkMsg(text, kind = 'info', action = null) {
@@ -190,6 +209,7 @@ function ago(t) {
 }
 
 function renderBoard() {
+  renderMoves();
   const live = ready();
   el.boardCard.dataset.live = String(live);
   if (live) {
@@ -230,12 +250,216 @@ el.btnBleAny.onclick = () => connectWith(ble, {});
 // Click the face = a touch. With a board connected the board does it (TAP) and reports back
 // (T touch, C <colors>, T release), and the preview follows; otherwise the preview does it alone.
 el.btnTap.onclick = () => {
+  if (touchMode === 'follow') return;   // follow mode: dragging, handled below
   if (ready()) { link.send('TAP'); return; }
   const t = nowMs();
   engine.touch(true, t);
   engine.touch(false, t);
   adoptColors({ face: engine.faceColor, eye: engine.eyeColor });
 };
+
+// ------------------------------------------------------------------ blink with me (camera)
+// The face model (MediaPipe, ~25 MB, runs in this browser) only loads once the camera is turned on.
+const blinkPrefs = { on: false, sensitivity: DEFAULT_SENSITIVITY, ...loadJSON(LS.blink, {}) };
+const detector = new BlinkDetector(blinkPrefs.sensitivity);
+let vision = null, modelReady = null, camOn = false, camFace = false, mirrored = 0, flashTimer = 0;
+const saveBlinkPrefs = () => saveJSON(LS.blink, { on: blinkPrefs.on, sensitivity: blinkPrefs.sensitivity });
+
+el.sens.value = Math.round(blinkPrefs.sensitivity * 100);
+const showSens = () => { el.sensLabel.textContent = sensitivityLabel(blinkPrefs.sensitivity); };
+showSens();
+el.sens.oninput = () => {
+  blinkPrefs.sensitivity = detector.sensitivity = el.sens.value / 100;
+  showSens();
+  saveBlinkPrefs();
+};
+
+async function startCamera() {
+  let stage = 'model';
+  el.camBox.hidden = false;
+  el.camMsg.textContent = 'starting the camera…';
+  el.btnCam.disabled = true;
+  try {
+    if (!vision) {
+      const { Vision } = await import('./vision.js');
+      vision = new Vision();
+      modelReady = vision.init();   // loads while the camera permission prompt is up
+      modelReady.catch(() => {});   // (awaited below)
+    }
+    stage = 'camera';
+    if (!navigator.mediaDevices?.getUserMedia) throw Object.assign(new Error('no camera API'), { name: 'NoCameraApi' });
+    await vision.startCamera(el.video);
+    el.camMsg.textContent = 'loading the face model…';
+    stage = 'model';
+    await modelReady;
+    camOn = true;
+    blinkPrefs.on = true; saveBlinkPrefs();
+    el.camMsg.textContent = '';
+    el.meterWrap.hidden = false;
+    const step = () => { if (!vision.stream) return; onCameraFrame(); el.video.requestVideoFrameCallback(step); };
+    el.video.requestVideoFrameCallback(step);
+  } catch (e) {
+    console.warn('[camera]', e);
+    vision?.stopCamera(el.video);
+    if (stage === 'model') vision = null;   // try loading again next time
+    camOn = false;
+    el.camMsg.textContent = stage === 'camera' ? ({
+      NotAllowedError: 'Camera blocked. Allow it with the icon in the address bar, then try again.',
+      NotFoundError: 'No camera found.',
+      NotReadableError: 'The camera is busy in another app.',
+      NoCameraApi: 'No camera access here. Use Chrome on https:// or http://localhost.',
+    }[e?.name] || `Camera unavailable: ${e?.message || e}`) : `The face model didn't load: ${e?.message || e}`;
+  }
+  el.btnCam.disabled = false;
+  renderCamButton();
+  renderBlinkStats();
+}
+
+function stopCamera() {
+  vision?.stopCamera(el.video);
+  camOn = false; camFace = false;
+  blinkPrefs.on = false; saveBlinkPrefs();
+  el.camBox.hidden = true;
+  el.meterWrap.hidden = true;
+  renderCamButton();
+  renderBlinkStats();
+}
+
+function onCameraFrame() {
+  if (!vision?.ready) return;
+  const t = performance.now();
+  let sig;
+  try { sig = vision.detect(el.video, Math.floor(t)); } catch { return; }
+  const hadFace = camFace;
+  camFace = sig.face;
+  if (detector.update(sig.face, sig.blink, t)) blinkWithYou();
+  el.camMsg.textContent = sig.face ? '' : 'Looking for your face…';
+  el.meterFill.style.width = `${Math.min(100, (sig.face ? sig.blink : 0) * 100)}%`;
+  el.meterFill.dataset.closed = String(detector.closed);
+  el.meterLine.style.left = `${Math.min(99.5, detector.threshold * 100)}%`;
+  if (hadFace !== camFace) renderBlinkStats();
+}
+
+// You blinked: the preview blinks now, and the board does too (B).
+function blinkWithYou() {
+  engine.mirrorBlink(nowMs());
+  if (ready()) link.send('B');
+  mirrored++;
+  el.blinkFlash.classList.add('on');
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => el.blinkFlash.classList.remove('on'), 120);
+  renderBlinkStats();
+}
+
+function renderCamButton() {
+  el.btnCam.textContent = camOn ? 'Turn off camera' : 'Turn on camera';
+  el.btnCam.classList.toggle('primary', !camOn);
+}
+
+function renderBlinkStats() {
+  const oldFw = ready() && board.fw < 3;
+  el.blinkStats.textContent = !camOn ? 'Camera off.'
+    : oldFw ? `Only the preview blinks with you: this board has firmware v${board.fw}. Flash the new firmware (v3) so the board does too.`
+    : !camFace ? 'Looking for your face…'
+    : `${mirrored} blink${mirrored === 1 ? '' : 's'} copied${ready() ? ' to the board' : ' (preview only: no board connected)'}.`;
+}
+
+el.btnCam.onclick = () => (camOn ? stopCamera() : startCamera());
+
+// ------------------------------------------------------------------ touch & moves
+// Touch mode: what touching the screen does. The board keeps its own (saved on it) and tells us
+// with "M swap|follow"; picking one here sends it. Moves play on the preview and the board together.
+const ACT_FOLLOW = 1, ACT_DART = 2, ACT_SHAKE = 3;   // engine.action (same numbers as eyes_anim.h)
+let touchMode = loadJSON(LS.touchMode, 'swap') === 'follow' ? 'follow' : 'swap';
+const movesOk = () => ready() && board.fw >= MOVES_FW;
+
+function setTouchMode(mode, { send = true } = {}) {
+  touchMode = mode === 'follow' ? 'follow' : 'swap';
+  saveJSON(LS.touchMode, touchMode);
+  if (send && movesOk()) link.send(`M ${touchMode}`);
+  if (touchMode !== 'follow' && dragging) endDrag();
+  renderMoves();
+}
+for (const b of el.touchMode.querySelectorAll('button')) b.onclick = () => setTouchMode(b.dataset.mode);
+
+function renderMoves() {
+  for (const b of el.touchMode.querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.mode === touchMode));
+  el.btnTap.dataset.mode = touchMode;
+  el.btnTap.title = touchMode === 'follow' ? 'Drag on the face: the eyes follow' : 'Touch the face';
+  el.btnTap.setAttribute('aria-label', touchMode === 'follow' ? 'Drag on the face: the eyes follow your pointer' : 'Touch the face: swap the colors');
+  const old = ready() && board.fw < MOVES_FW;
+  el.touchNote.textContent = touchMode === 'follow'
+    ? 'Touch the board and drag: the eyes follow your finger, stay a moment when you let go, then wander home. Drag on the preview to do the same.'
+    : 'Touch the board: the face and eye colors swap. Touch again to swap back.';
+  if (old) el.touchNote.textContent += ` (Your board has firmware v${board.fw}, which only swaps colors.)`;
+  el.movesNote.textContent = old ? `Preview only: this board has firmware v${board.fw}. Flash the new firmware (v${MOVES_FW}) so the board moves too.`
+    : ready() ? 'The board and the preview move together. Shortcuts: ← → S and H.'
+    : 'No board connected: the moves play on the preview. Shortcuts: ← → S and H.';
+  el.moodSub.textContent = touchMode === 'follow'
+    ? (ready() ? 'Touch the board, or drag on the face here: the eyes follow.' : 'Drag on the face: the eyes follow.')
+    : (ready() ? 'Touch the board, or click the face here, to swap the colors.' : 'Click the face to try a touch: the colors swap.');
+}
+
+function dart(dir) {
+  engine.dart(dir, nowMs());
+  if (movesOk()) link.send(dir < 0 ? 'DART L' : 'DART R');
+}
+function shake() {
+  const seed = ((Math.random() * 2 ** 32) >>> 0) || 1;   // same seed on both = the same bounces
+  engine.shake(seed, nowMs());
+  if (movesOk()) link.send(`SHAKE ${seed}`);
+}
+// Heart eyes: on until you turn them off (the preview and the board together).
+function setHearts(on, { send = true } = {}) {
+  engine.setHearts(on, nowMs());
+  el.btnHearts.setAttribute('aria-pressed', String(on));
+  el.btnHearts.lastChild.textContent = on ? ' Back to normal eyes' : ' Heart eyes';
+  if (send && movesOk()) link.send(on ? 'H 1' : 'H 0');
+}
+el.btnHearts.onclick = () => setHearts(!engine.heartsOn);
+el.btnDartL.onclick = () => dart(-1);
+el.btnDartR.onclick = () => dart(1);
+el.btnShake.onclick = () => shake();
+document.addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey || e.target.closest?.('input, textarea')) return;
+  if (e.key === 'ArrowLeft') { dart(-1); e.preventDefault(); }
+  else if (e.key === 'ArrowRight') { dart(1); e.preventDefault(); }
+  else if (e.key === 's' || e.key === 'S') shake();
+  else if (e.key === 'h' || e.key === 'H') setHearts(!engine.heartsOn);
+});
+
+// Follow mode: drag on the preview and the eyes follow, on the board too (F lines, ~30 a second).
+let dragging = false, lastFollowSent = 0, lastFollow = null;
+function pointOnFace(e) {
+  const r = $('screen').getBoundingClientRect();
+  const px = (e.clientX - r.left) / r.width * SCREEN, py = (e.clientY - r.top) / r.height * SCREEN;
+  return [(px - SCREEN / 2) / CONFIG.faceRadius, (py - SCREEN / 2) / CONFIG.faceRadius];
+}
+function dragTo(e, force) {
+  const [x, y] = pointOnFace(e), t = nowMs();
+  engine.follow(x, y, t);
+  lastFollow = [x, y];
+  if (movesOk() && (force || t - lastFollowSent >= 33)) { link.send(followLine(x, y)); lastFollowSent = t; }
+}
+function endDrag() {
+  dragging = false;
+  engine.followEnd(nowMs());
+  if (movesOk()) {
+    if (lastFollow) link.send(followLine(...lastFollow));   // where it really ended (sends are throttled)
+    link.send('F up');
+  }
+  lastFollow = null;
+}
+el.btnTap.addEventListener('pointerdown', (e) => {
+  if (touchMode !== 'follow') return;
+  dragging = true;
+  el.btnTap.setPointerCapture(e.pointerId);
+  dragTo(e, true);
+  e.preventDefault();
+});
+el.btnTap.addEventListener('pointermove', (e) => { if (dragging) dragTo(e, false); });
+el.btnTap.addEventListener('pointerup', () => { if (dragging) endDrag(); });
+el.btnTap.addEventListener('pointercancel', () => { if (dragging) endDrag(); });
 
 let toastTimer = 0;
 function toast(msg) {
@@ -246,17 +470,17 @@ function toast(msg) {
 }
 
 // ------------------------------------------------------------------ frame loop
-let lastSmile = null, lastLive = null;
+let lastMood = '';
 function frame() {
   engine.update(nowMs());
   preview.draw(engine);
-  const smile = engine.smilingNow, live = ready();
-  if (smile !== lastSmile || live !== lastLive) {
-    lastSmile = smile; lastLive = live;
-    el.mood.dataset.smile = String(smile);
-    el.mood.textContent = smile ? 'smiling at you' : 'just looking around';
-    el.moodSub.textContent = live ? 'Touch the board, or click the face here.' : 'Click the face to try a touch.';
-  }
+  const act = engine.action;
+  const mood = act === ACT_FOLLOW ? 'following your finger'
+    : act === ACT_DART ? (engine.anim.dartDir < 0 ? 'darting left' : 'darting right')
+    : act === ACT_SHAKE ? 'whoa, shaken!'
+    : engine.heartsOn ? 'in love'
+    : camOn && camFace ? 'blinking with you' : 'just looking around';
+  if (mood !== lastMood) { lastMood = mood; el.mood.textContent = mood; }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -264,5 +488,9 @@ requestAnimationFrame(frame);
 renderPill({ state: 'disconnected', kind: 'usb' });
 renderConnButtons();
 renderBoard();
+renderMoves();
+renderCamButton();
+renderBlinkStats();
+if (blinkPrefs.on) startCamera();   // it was on last time (Chrome remembers the camera permission)
 // Reopen a board this site was allowed to use before: USB first, then the last Bluetooth board.
 usb.autoReconnect().then((ok) => ok || ble.autoReconnect(known?.id)).catch(() => {});

@@ -2,8 +2,13 @@
 //   clang++ -O2 -std=c++17 -o preview extras/preview/preview.cpp
 //   ./preview sheet.ppm [touch_ms...]    (frames every 50 ms, default touch at 2000 ms;
 //                                         each touch holds the finger down for 250 ms)
+//   MOVE=dartL|dartR|shake|follow|hearts ./preview sheet.ppm 2000    (a move instead of a touch;
+//                                         follow = a finger drawing a circle for 1.5 s;
+//                                         hearts = heart eyes for 1.8 s)
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cmath>
 #include <vector>
 #include "../../eyes_render.h"
 #include "../../eyes_anim.h"
@@ -18,12 +23,13 @@ int main(int argc, char **argv) {
   for (int i = 2; i < argc; i++) taps.push_back(atoi(argv[i]));
   if (taps.empty()) taps.push_back(2000);
 
+  const char *move = getenv("MOVE") ? getenv("MOVE") : "touch";
   AnimConfig c;
   // keep in sync with the settings at the top of RoboEyes.ino
   c.face = 0xFFFFFF; c.eyes = 0x000000;
   c.faceRadius = 236; c.homeYaw = 28; c.homePitch = 27; c.homeRoll = -10;
   c.wander = 10; c.drift = 4; c.gazeSpeed = 1; c.followYaw = 40; c.followPitch = 30;
-  c.wipeMs = 650; c.smileMs = 2500;
+  c.wipeMs = 650;
   c.eye = { 0.25f, 0.0f, 0.10f, 0.11f, 0.0f }; c.screenSize = N;
   Animator a; a.begin(c, 12345, 1);
 
@@ -33,8 +39,19 @@ int main(int argc, char **argv) {
   int tile = 0;
   for (uint32_t t = 1; tile < COLS * ROWS; t += 10) {     // simulate at 100 fps
     for (uint32_t tp : taps) {
-      if (t <= tp && tp < t + 10) a.touch(true, t);
-      if (t <= tp + 250 && tp + 250 < t + 10) a.touch(false, t);
+      bool at = t <= tp && tp < t + 10;
+      if (!strcmp(move, "touch")) {
+        if (at) a.touch(true);
+        if (t <= tp + 250 && tp + 250 < t + 10) a.touch(false);
+      } else if (!strcmp(move, "dartL") && at) a.dart(-1, t);
+      else if (!strcmp(move, "dartR") && at) a.dart(1, t);
+      else if (!strcmp(move, "shake") && at) a.shake(1234567, t);
+      else if (!strcmp(move, "hearts") && at) a.setHearts(true, t);
+      else if (!strcmp(move, "hearts") && t <= tp + 1800 && tp + 1800 < t + 10) a.setHearts(false, t);
+      else if (!strcmp(move, "follow") && t >= tp && t < tp + 1500) {
+        float k = (t - tp) / 1500.f * 6.2831853f;
+        a.follow(0.55f * cosf(k), 0.55f * sinf(k), t);
+      } else if (!strcmp(move, "follow") && t >= tp + 1500 && t < tp + 1510) a.followEnd(t);
     }
     a.update(t);
     if (t >= FIRST_MS && (t - FIRST_MS) % STEP_MS < 10) {

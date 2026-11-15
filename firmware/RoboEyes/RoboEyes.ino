@@ -7,9 +7,13 @@
  *
  * - On its own: white face, black eyes (or your colors). Both eyes blink
  *   together and glide around.
- * - Touch: the face and eye colors swap with a circular wipe and the eyes
- *   smile (while your finger is down, plus 2.5 s after it lifts). Then the
- *   usual pill eyes come back; the swapped colors stay.
+ * - Touch: the face and eye colors swap with a circular wipe. The eyes stay
+ *   the same pills; touch again to swap back.
+ * - Blink with you: with the web app's camera on, it blinks when you blink.
+ * - Touch can instead make the eyes follow your finger (pick it in the web app;
+ *   the board remembers). From the web app: dart left / right, and shake (the
+ *   eyes bounce all around the screen, squashing as they hit the edge), and
+ *   heart eyes (the pills melt into beating hearts).
  *
  * Web app: https://softobsessing.github.io/RoboEyes/ connects over USB or
  * Bluetooth ("RoboEyes-XXXX") to pick the face and eye colors live and save
@@ -68,7 +72,15 @@
 #define GAZE_DRIFT        4          // degrees of slow continuous floating
 #define GAZE_SPEED        1.0f       // eye movement speed: lower = slower and silkier
 #define WIPE_MS           650        // speed of the color swap when touched
-#define SMILE_MS          2500       // the touch smile lasts this long after the finger lifts
+
+// What touching the screen does until the web app picks: 0 = swap the colors,
+// 1 = the eyes follow your finger. (The board remembers the web app's choice.)
+#define TOUCH_MODE        0
+// If the eyes follow your finger to the wrong spot (mirrored, or turned), fix
+// the touch panel's axes here: swap X/Y first, then flip.
+#define TOUCH_SWAP_XY     0
+#define TOUCH_FLIP_X      0
+#define TOUCH_FLIP_Y      0
 
 // Eye shape, in fractions of the ball radius
 #define EYE_SPACING       0.25f      // half the distance between the eyes
@@ -85,7 +97,7 @@
 // Web app link. Bluetooth name = BLE_NAME-<board ID>, e.g. "RoboEyes-3F2A"; keep "RoboEyes",
 // that's what the RoboEyes web app looks for.
 #define BLE_NAME          "RoboEyes"
-#define FW_VERSION        2          // shown in the web app
+#define FW_VERSION        4          // shown in the web app (3: blinks with you; 4: follow finger, dart, shake, hearts)
 #define FOLLOW_YAW        40         // degrees the eyes turn when the website looks fully left/right
 #define FOLLOW_PITCH      30         // degrees the eyes turn when the website looks fully up/down
 #define LINK_TIMEOUT_MS   3000       // no message from the website this long = back to standalone
@@ -210,24 +222,40 @@ static void displayInit() {
 //  Touch (FT3168) - polled on its own task so it can never stall a frame
 // =====================================================================
 static volatile bool touchDownPending = false, touchUpPending = false;
+// Latest finger position, in one word so the frame loop always reads a matching
+// pair: bit 31 = finger down, bits 16..27 = x, bits 0..11 = y (panel pixels).
+static volatile uint32_t touchState = 0;
+static const uint32_t TOUCH_DOWN_BIT = 0x80000000u;
 
-static bool isTouched() {
+// First touch point: count at 0x02, then X high/low at 0x03/0x04, Y at 0x05/0x06.
+static bool readTouch(uint16_t &x, uint16_t &y) {
   Wire.beginTransmission(FT3168_ADDR);
-  Wire.write(0x02);   // number of touch points
+  Wire.write(0x02);
   if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom(FT3168_ADDR, 1) != 1) return false;
-  uint8_t n = Wire.read() & 0x0F;
-  return n > 0 && n < 6;
+  if (Wire.requestFrom(FT3168_ADDR, 5) != 5) return false;
+  uint8_t b[5];
+  for (int i = 0; i < 5; i++) b[i] = Wire.read();
+  uint8_t n = b[0] & 0x0F;
+  if (n == 0 || n > 5) return false;
+  x = ((b[1] & 0x0F) << 8) | b[2];
+  y = ((b[3] & 0x0F) << 8) | b[4];
+  return true;
 }
 
 static void touchTask(void *) {
   bool down = false;
-  uint32_t lastDown = 0;
+  uint8_t misses = 0;
   for (;;) {
-    bool now = isTouched();
-    uint32_t ms = millis();
-    if (now && !down && ms - lastDown > 250) { down = true; lastDown = ms; touchDownPending = true; }
-    else if (!now && down) { down = false; touchUpPending = true; }
+    uint16_t x, y;
+    if (readTouch(x, y)) {
+      misses = 0;
+      touchState = TOUCH_DOWN_BIT | ((uint32_t)(x & 0xFFF) << 16) | (y & 0xFFF);
+      if (!down) { down = true; touchDownPending = true; }
+    } else if (down && ++misses >= 2) {   // two empty reads in a row = lifted (skips one-off glitches)
+      down = false;
+      touchState = touchState & ~TOUCH_DOWN_BIT;   // keep the last spot
+      touchUpPending = true;
+    }
     vTaskDelay(pdMS_TO_TICKS(15));
   }
 }
@@ -298,12 +326,22 @@ static void pushRect(const eyes::Scene &s, const eyes::Prepared &p, const eyes::
 //  Web app link (same text protocol over USB serial and Bluetooth)
 //   app -> board   P                       hello? (sent on connect)
 //                  K <face RRGGBB> <eyes RRGGBB>   set the colors now (dragging the color wheel)
-//                  TAP                     do what a touch does (swap colors + smile)
+//                  TAP                     do what a touch does (swap the colors)
 //                  E <neutral|happy|side|sad> <lookX -100..100> <lookY -100..100>   drive mood + gaze
-//                  B | B2                  blink now / double blink (only while E lines keep coming)
-//   board -> app   HELLO RoboEyes <protocol> <board ID> <firmware>   e.g. "HELLO RoboEyes 2 3F2A 2"
+//                  B                       blink now (the web app's camera saw you blink)
+//                  B2                      double blink (only while E lines keep coming)
+//                  M swap | M follow       what touching the screen does (saved on the board)
+//                  F <x> <y> | F up        eyes follow a finger dragged on the web app's preview
+//                                          (x, y: -100..100 = ball radius, from the screen center)
+//                  DART L | DART R         quick glance to the screen's left / right
+//                  SHAKE <seed>            bounce all around the screen (same seed = same bounces)
+//                  H 1 | H 0               heart eyes on / off
+//   board -> app   HELLO RoboEyes <protocol> <board ID> <firmware>   e.g. "HELLO RoboEyes 2 3F2A 4"
 //                  C <face RRGGBB> <eyes RRGGBB>   current colors (after HELLO and after every swap)
-//                  T touch | T release
+//                  T touch | T release     (touch = swap mode)
+//                  F <x> <y> | F up        the finger, while the eyes follow it (follow mode)
+//                  M swap | M follow       touch mode (after HELLO and whenever it changes)
+//                  H 1 | H 0               heart eyes (after HELLO and whenever they change)
 //                  D fps <n> draw_ms <n>   (USB only, every 10 s; the app ignores it)
 // =====================================================================
 #define PROTOCOL 2
@@ -311,6 +349,11 @@ static char boardId[8] = "0000";
 static Preferences prefs;   // NVS "roboeyes": the colors, so they survive power-off
 static uint32_t savedFace, savedEyes, colorsChangedAt = 0;
 static bool colorsDirty = false;
+
+static uint8_t touchMode = TOUCH_MODE;   // 0 = swap colors, 1 = eyes follow the finger
+static bool swapHeld = false, fingerFollowing = false, appFollowing = false;
+static uint32_t lastSwapMs = 0, lastFollowEmitMs = 0, appFollowMs = 0;
+static int lastFx = 9999, lastFy = 9999;
 
 static bool haveLink = false;
 static uint32_t lastLinkMs = 0;
@@ -349,9 +392,46 @@ static void saveColorsWhenSettled(uint32_t now) {
   }
 }
 
+static void emitMode() { emit(touchMode ? "M follow" : "M swap"); }
+static void emitHearts() { emit(anim.heartsOn() ? "H 1" : "H 0"); }
+
+static void setTouchMode(uint8_t m) {
+  if (m != touchMode) {
+    touchMode = m;
+    prefs.putUChar("touch", m);
+    if (fingerFollowing) { fingerFollowing = false; anim.followEnd(millis()); }
+  }
+  emitMode();
+}
+
+// A panel pixel -> ball radii from the screen center, the way the picture is turned.
+static void touchToFace(uint32_t st, float &x, float &y) {
+  float X = (float)((st >> 16) & 0xFFF), Y = (float)(st & 0xFFF);
+  if (TOUCH_SWAP_XY) { float t = X; X = Y; Y = t; }
+  if (TOUCH_FLIP_X) X = LCD_SIZE - 1 - X;
+  if (TOUCH_FLIP_Y) Y = LCD_SIZE - 1 - Y;
+  X += 0.5f; Y += 0.5f;
+  float lx = xform.ox + xform.xx * X + xform.xy * Y;
+  float ly = xform.oy + xform.yx * X + xform.yy * Y;
+  x = (lx - LCD_SIZE * 0.5f) / FACE_RADIUS;
+  y = (ly - LCD_SIZE * 0.5f) / FACE_RADIUS;
+}
+
+// Tell the web app where the finger is (so its preview follows too), ~25 times a second.
+static void emitFollow(float x, float y, uint32_t now, bool force) {
+  int ix = (int)lroundf(x * 100.f), iy = (int)lroundf(y * 100.f);
+  ix = ix < -100 ? -100 : (ix > 100 ? 100 : ix);
+  iy = iy < -100 ? -100 : (iy > 100 ? 100 : iy);
+  if (!force && (now - lastFollowEmitMs < 40 || (ix == lastFx && iy == lastFy))) return;
+  lastFollowEmitMs = now; lastFx = ix; lastFy = iy;
+  char line[24];
+  snprintf(line, sizeof line, "F %d %d", ix, iy);
+  emit(line);
+}
+
 // A finger down / up on the screen (or the web app's TAP).
-static void onTouch(bool down, uint32_t now) {
-  anim.touch(down, now);
+static void onTouch(bool down) {
+  anim.touch(down);
   emit(down ? "T touch" : "T release");
   if (down) emitColors();   // the colors it's swapping to
 }
@@ -362,6 +442,41 @@ static void onLine(const char *line, uint32_t now) {
   if (line[0] == 'P' && line[1] == 0) {
     emitHello();
     emitColors();
+    emitMode();
+    emitHearts();
+    return;
+  }
+  if (strcmp(line, "H 1") == 0 || strcmp(line, "H 0") == 0) {
+    anim.setHearts(line[2] == '1', now);
+    emitHearts();
+    return;
+  }
+  if (strcmp(line, "M swap") == 0 || strcmp(line, "M follow") == 0) {
+    setTouchMode(line[2] == 'f' ? 1 : 0);
+    return;
+  }
+  if (strcmp(line, "F up") == 0) {
+    if (appFollowing) { appFollowing = false; if (!fingerFollowing) anim.followEnd(now); }
+    return;
+  }
+  int fx = 0, fy = 0;
+  if (line[0] == 'F' && sscanf(line, "F %d %d", &fx, &fy) == 2) {
+    if (!fingerFollowing) {   // a finger on the board itself wins
+      fx = fx < -100 ? -100 : (fx > 100 ? 100 : fx);
+      fy = fy < -100 ? -100 : (fy > 100 ? 100 : fy);
+      anim.follow(fx / 100.f, fy / 100.f, now);
+      appFollowing = true;
+      appFollowMs = now;
+    }
+    return;
+  }
+  if (strcmp(line, "DART L") == 0 || strcmp(line, "DART R") == 0) {
+    anim.dart(line[5] == 'L' ? -1 : 1, now);
+    return;
+  }
+  unsigned long seed = 0;
+  if (sscanf(line, "SHAKE %lu", &seed) == 1) {
+    anim.shake((uint32_t)seed, now);
     return;
   }
   unsigned face = 0, eyes = 0;
@@ -370,12 +485,16 @@ static void onLine(const char *line, uint32_t now) {
     return;
   }
   if (strcmp(line, "TAP") == 0) {
-    onTouch(true, now);
-    onTouch(false, now);
+    onTouch(true);
+    onTouch(false);
     return;
   }
-  if (line[0] == 'B' && (line[1] == 0 || (line[1] == '2' && line[2] == 0))) {
-    if (linked(now)) anim.blinkNow(now, line[1] == '2');
+  if (strcmp(line, "B") == 0) {   // the web app saw you blink: blink with you, right now
+    anim.mirrorBlink(now);
+    return;
+  }
+  if (strcmp(line, "B2") == 0) {
+    if (linked(now)) anim.blinkNow(now, true);
     return;
   }
   char mood[16];
@@ -414,6 +533,34 @@ static void pollLinks(uint32_t now) {
     for (size_t i = 0; i < n; i++) bleLine.feed(tmp[i], now);
 }
 
+// Touch: swap the colors, or (follow mode) the eyes follow the finger. Either
+// way the web app hears about it, so its preview and color picker follow.
+static void handleTouch(uint32_t now) {
+  bool down = false, up = false;
+  if (touchDownPending) { touchDownPending = false; down = true; }
+  if (touchUpPending) { touchUpPending = false; up = true; }
+  uint32_t st = touchState;
+  if (touchMode == 0) {
+    if (down && now - lastSwapMs > 250) { lastSwapMs = now; swapHeld = true; onTouch(true); }
+    if (up && swapHeld) { swapHeld = false; onTouch(false); }
+    return;
+  }
+  if ((st & TOUCH_DOWN_BIT) || down) {   // (a quick tap may already be over: still go there)
+    float x, y;
+    touchToFace(st, x, y);
+    anim.follow(x, y, now);
+    if (!fingerFollowing) appFollowing = false;
+    fingerFollowing = true;
+    emitFollow(x, y, now, down);
+  } else if (fingerFollowing) {
+    fingerFollowing = false;
+    anim.followEnd(now);
+    emit("F up");
+  }
+  // the web app stopped sending (closed mid-drag?): let go
+  if (appFollowing && now - appFollowMs > 1500) { appFollowing = false; anim.followEnd(now); }
+}
+
 // =====================================================================
 //  Arduino entry points
 // =====================================================================
@@ -432,6 +579,7 @@ void setup() {
   prefs.begin("roboeyes", false);
   savedFace = prefs.getUInt("face", DEFAULT_FACE) & 0xFFFFFF;
   savedEyes = prefs.getUInt("eyes", DEFAULT_EYES) & 0xFFFFFF;
+  touchMode = prefs.getUChar("touch", TOUCH_MODE) ? 1 : 0;
   cfg.face = savedFace;
   cfg.eyes = savedEyes;
   cfg.faceRadius = FACE_RADIUS;
@@ -442,7 +590,6 @@ void setup() {
   cfg.followYaw = FOLLOW_YAW;
   cfg.followPitch = FOLLOW_PITCH;
   cfg.wipeMs = WIPE_MS;
-  cfg.smileMs = SMILE_MS;
   cfg.eye.spacing = EYE_SPACING;
   cfg.eye.height = EYE_HEIGHT;
   cfg.eye.radius = EYE_WIDTH * 0.5f;
@@ -462,6 +609,7 @@ void setup() {
   ble_begin(name);
   emitHello();
   emitColors();
+  emitMode();
 }
 
 void loop() {
@@ -471,9 +619,7 @@ void loop() {
 
   uint32_t now = millis();
 
-  // touch: swap the colors + smile; tell the web app so its preview and color picker follow
-  if (touchDownPending) { touchDownPending = false; onTouch(true, now); }
-  if (touchUpPending) { touchUpPending = false; onTouch(false, now); }
+  handleTouch(now);
 
   // the website (if connected) picks the mood, the gaze and when to blink
   pollLinks(now);

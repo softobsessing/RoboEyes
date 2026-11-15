@@ -4,8 +4,7 @@
 //
 // The character: the round screen is a 3D ball (the face), the eyes are two pill-shaped holes in
 // it. The ball turns to look around, so the pills foreshorten near the rim. A touch swaps the face
-// and eye colors with a circular wipe and the eyes smile (arches) while the finger is down plus
-// smileMs after it lifts; then the usual pills come back and the swapped colors stay.
+// and eye colors with a circular wipe; the eyes themselves don't change.
 //
 // If you change shapes, moods, colors or timings in the firmware, change them here too and run
 // the pixel test (see the README): test/roboeyes_port.test.mjs.
@@ -14,6 +13,33 @@ export const MOODS = ['neutral', 'happy', 'side', 'sad'];
 const NEUTRAL = 0;
 export const SCREEN = 466;
 const DEG = Math.PI / 180;
+// after a blink copied from the person watching, no random blinks for this long (ms)
+const MIRROR_QUIET_MS = 9000;
+
+// ---- moves (same constants as eyes_anim.h) ----
+const REACH_X = 0.76, REACH_Y = 0.84;
+const FOLLOW_OMEGA = 32;
+const FOLLOW_REST_MS = 900;
+const DART_X = 0.70;
+const DART_HOLD_MS = 850;
+const SHAKE_BOUNCE = 0.85;
+const SHAKE_MAX_MS = 3800;
+const SHAKE_KICK_MS = [0, 170, 340, 510, 680, 850];
+const SHAKE_KICK_SPEED = [8.0, 7.5, 7.0, 6.5, 5.5, 4.5];
+// heart eyes (same as eyes_anim.h)
+const HEARTBEAT_MS = 1000, HEARTBEAT_LUB = 0.10, HEARTBEAT_DUB = 0.06;
+const bump = (t, start, len) => { if (t < start || t >= start + len) return 0; const u = Math.sin((t - start) * Math.PI / len); return u * u; };
+export const ACT = { NONE: 0, FOLLOW: 1, DART: 2, SHAKE: 3 };
+const clampf = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+function pointToPose(x, y) {
+  const pt = Math.asin(clampf(-y, -0.97, 0.97));
+  return [Math.asin(clampf(x / Math.cos(pt), -0.97, 0.97)), pt];
+}
+function clampReach(x, y) {
+  const qx = x / REACH_X, qy = y / REACH_Y, q = qx * qx + qy * qy;
+  if (q > 1) { const k = 1 / Math.sqrt(q); return [x * k, y * k]; }
+  return [x, y];
+}
 
 // ---- same defaults as the settings at the top of RoboEyes.ino ----
 export const CONFIG = {
@@ -22,7 +48,7 @@ export const CONFIG = {
   homeYaw: 28, homePitch: 27, homeRoll: -10,
   wander: 10, drift: 4, gazeSpeed: 1.0,
   followYaw: 40, followPitch: 30,
-  wipeMs: 650, smileMs: 2500,
+  wipeMs: 650,
   eye: { spacing: 0.25, height: 0.0, radius: 0.10, halfLen: 0.11, tilt: 0 },
   screenSize: SCREEN,
 };
@@ -34,9 +60,6 @@ const MOOD_STYLES = [
   [0.46, 0.00, 0.00, 0],    // side-eye: flat, half-closed upper lids
   [0.34, 0.85, 0.00, -8],   // sad ("disappointed"): droopy outer corners, head down
 ];
-const HAPPY = 1;
-// where the eyes look while smiling after a touch: at the person who touched it (deg)
-const SMILE_YAW = 0, SMILE_PITCH = 0, SMILE_ROLL = 0;
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const hexColor = (c) => ({ r: (c >> 16) & 0xFF, g: (c >> 8) & 0xFF, b: c & 0xFF });
@@ -57,6 +80,17 @@ function faceToScreen(p, fu, fv) {
   const v = fu * p.sr + fv * p.cr;
   const w = Math.sqrt(Math.max(0, 1 - u * u - v * v));
   return [p.m00 * u + p.m10 * v + p.m20 * w, p.m11 * v + p.m21 * w, p.m02 * u + p.m12 * v + p.m22 * w];
+}
+
+// heart size in face units per heartSize (same as HEART_K in eyes_render.h)
+const HEART_K = 0.30;
+// Inigo Quilez's exact heart SDF: tip at (0, 0), lobes on top (+y up), ~1.2 wide, 1.1 tall
+function sdHeart(x, y) {
+  x = Math.abs(x);
+  if (y + x > 1) { const dx = x - 0.25, dy = y - 0.75; return Math.sqrt(dx * dx + dy * dy) - 0.35355339; }
+  const ay = y - 1, d1 = x * x + ay * ay;
+  const m = 0.5 * Math.max(x + y, 0), bx = x - m, by = y - m, d2 = bx * bx + by * by;
+  return Math.sqrt(Math.min(d1, d2)) * (x > y ? 1 : -1);
 }
 
 export function prepare(s) {
@@ -80,6 +114,9 @@ export function prepare(s) {
   p.topK = s.lidSlant * L / B;
   p.topNorm = 1 / Math.sqrt(1 + p.topK * p.topK);
   p.happyOn = h > 0.001;
+  p.heart = clamp01(s.heart || 0);
+  p.heartOn = p.heart > 0.001;
+  p.heartK = HEART_K * (s.heartSize ?? 1);
   p.holeA = -hl + 0.1 * B;
   p.holeR = h * 0.55 * B;
   p.cutA = L + ((-hl + 0.3 * B) - L) * h;
@@ -92,7 +129,9 @@ export function prepare(s) {
   p.aMid = closeMid + (openMid - closeMid) * bl;
   p.openHalf = Math.max(bl * 0.5 * (aBot - aTop), 2.4 / s.ballR);
 
-  const A0 = Math.max(-L, p.aMid - p.openHalf), A1 = Math.min(L, p.aMid + p.openHalf);
+  let BB = B, LL = L;
+  if (p.heartOn) { BB = Math.max(B, 0.61 * p.heartK); LL = Math.max(L, 0.60 * p.heartK); }
+  const A0 = Math.max(-LL, p.aMid - p.openHalf), A1 = Math.min(LL, p.aMid + p.openHalf);
   const K = 6;
   p.eyeOn = [false, false];
   p.eyeBox = [null, null];
@@ -101,8 +140,8 @@ export function prepare(s) {
     let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9, zmax = -2;
     for (let k = 0; k <= K; k++) {
       const t = k / K;
-      const ta = A0 + (A1 - A0) * t, tb = -B + 2 * B * t;
-      const pts = [[-B, ta], [B, ta], [tb, A0], [tb, A1]];
+      const ta = A0 + (A1 - A0) * t, tb = -BB + 2 * BB * t;
+      const pts = [[-BB, ta], [BB, ta], [tb, A0], [tb, A1]];
       for (const [b, a] of pts) {
         const fu = b * p.ct + a * st + side * s.eye.spacing;
         const fv = -b * st + a * p.ct + s.eye.height;
@@ -132,6 +171,11 @@ function pillDist(s, p, fu, fv, side) {
   const aa = Math.abs(a);
   let ex = aa - p.hl; ex = ex > 0 ? ex : 0;
   let d = Math.sqrt(b * b + ex * ex) - p.B;
+  if (p.heartOn) {
+    const k = p.heartK;
+    const dh = sdHeart(b / k, 0.52 - a / k) * k;
+    d += (dh - d) * p.heart;
+  }
   const outer = b * side;
   const top = (p.topC + p.topK * outer - a) * p.topNorm;
   if (top > d) d = top;
@@ -239,11 +283,19 @@ export class Animator {
     this.face = this.toFace = cfg.face; this.eyes = this.toEyes = cfg.eyes; this.repaint = false;
     this.wiping = false; this.wipeK = 0; this.wipeDir = 1; this.prevWipeR = 0;
     this.ringOn = false; this.ringR0 = 0; this.ringR1 = 0;
-    this.held = false; this.smileEnd = 0; this.wasSmiling = false;
     this.nextGaze = (now + 1500) >>> 0;
     this.nextBlink = (now + 1800) >>> 0;
     this.blinkStart = 0; this.blinksLeft = 0; this.blinkEvent = false; this.blinkEventTwice = false;
+    this.quietUntil = now;
     this.t0 = now; this.last = now;
+    this.act = ACT.NONE; this.actStart = now; this.physT = now; this.homeNext = false;
+    this.fol = [new Smooth2(), new Smooth2()]; this.goalX = 0; this.goalY = 0;
+    this.dartDir = 1; this.dartY = 0; this.dartW = 0; this.dartV = 0;
+    this.bx = 0; this.by = 0; this.bvx = 0; this.bvy = 0; this.kicks = 0; this.srng = 1;
+    this.baseYaw = this.yaw.value(); this.basePitch = this.pitch.value(); this.baseRoll = this.roll.value();
+    this.baseX = Math.cos(this.basePitch) * Math.sin(this.baseYaw); this.baseY = -Math.sin(this.basePitch);
+    this.velX = 0; this.velY = 0; this.squash = 0; this.squashV = 0; this.lean = new Spring();
+    this.hearts = false; this.heartK = 0; this.heartV = 0; this.heartT0 = now;
     this.s = {};
     return this;
   }
@@ -254,6 +306,7 @@ export class Animator {
   setLook(x, y) { this.lookX = x < -1 ? -1 : x > 1 ? 1 : x; this.lookY = y < -1 ? -1 : y > 1 ? 1 : y; }
   setAutoBlink(on) { this.autoBlink = on; }
   blinkNow(now, twice) { if (this.blinkStart) return false; this.startBlink(now, twice ? 2 : 1); return true; }
+  mirrorBlink(now) { this.quietUntil = (now + MIRROR_QUIET_MS) >>> 0; return this.blinkNow(now, false); }
   setColors(face, eyes) {
     face &= 0xFFFFFF; eyes &= 0xFFFFFF;
     if (face === this.faceColor() && eyes === this.eyeColor()) return;
@@ -266,18 +319,32 @@ export class Animator {
     this.toFace = this.eyes; this.toEyes = this.face;
     this.wiping = true; this.wipeK = 0; this.wipeDir = 1; this.prevWipeR = 0;
   }
-  touch(down, now) {
+  touch(down) { if (down) this.swapColors(); }
+
+  // ---------------- moves ----------------
+  follow(x, y, now) {
     now >>>= 0;
-    if (down) {
-      this.swapColors();
-      this.held = true;
-      this.br.v += 140;
-      if (this.blinkStart) this.blinksLeft = 1;
-      if ((((this.nextBlink - (now + 1500)) | 0)) < 0) this.nextBlink = (now + 1500) >>> 0;
-    } else if (this.held) {
-      this.held = false;
-      this.smileEnd = ((now + this.c.smileMs) >>> 0) || 1;
-    }
+    if (this.act !== ACT.FOLLOW) { this.beginAct(ACT.FOLLOW, now); this.fol[0].reset(this.baseX); this.fol[1].reset(this.baseY); }
+    [this.goalX, this.goalY] = clampReach(x, y);
+  }
+  followEnd(now) { if (this.act === ACT.FOLLOW) this.settle(now >>> 0, FOLLOW_REST_MS, false); }
+  dart(dir, now) {
+    this.beginAct(ACT.DART, now >>> 0);
+    this.dartDir = dir < 0 ? -1 : 1;
+    this.dartY = this.baseY * 0.5;
+    this.dartW = this.dartV = 0;
+  }
+  shake(seed, now) {
+    now >>>= 0;
+    this.beginAct(ACT.SHAKE, now);
+    this.srng = (seed >>> 0) || 0x2545F491;
+    this.bx = this.baseX; this.by = this.baseY; this.bvx = this.bvy = 0; this.kicks = 0;
+    this.quietUntil = (now + SHAKE_MAX_MS) >>> 0;
+  }
+  action() { return this.act; }
+  setHearts(on, now) {
+    if (on && !this.hearts) this.heartT0 = now >>> 0;
+    this.hearts = !!on;
   }
 
   // ---------------- per frame ----------------
@@ -289,11 +356,6 @@ export class Animator {
     if (dt > 0.1) dt = 0.1;
     this.last = now;
     const t = ((now - this.t0) >>> 0) * 0.001;
-
-    const smile = this.smiling(now);
-    if (!smile) this.smileEnd = 0;
-    if (this.wasSmiling && !smile && !this.linked) { this.goHome(); this.nextGaze = (now + this.rand(1800, 3000)) >>> 0; }
-    this.wasSmiling = smile;
 
     if (this.linked && this.autoBlink) {
       if (reached(now, this.nextJitter)) {
@@ -312,13 +374,10 @@ export class Animator {
       this.tYaw = lx * c.followYaw * DEG;
       this.tPitch = -ly * c.followPitch * DEG;
       this.tRoll = -lx * 5 * DEG;
-    } else if (smile) {
-      omega = 8.5;
-      this.tYaw = SMILE_YAW * DEG; this.tPitch = SMILE_PITCH * DEG; this.tRoll = SMILE_ROLL * DEG;
     } else {
       omega = 5.5;
       if (reached(now, this.nextGaze)) {
-        this.pickIdleGaze();
+        if (this.homeNext) { this.goHome(); this.homeNext = false; } else this.pickIdleGaze();
         this.nextGaze = (now + this.rand(1500, 4000)) >>> 0;
       }
     }
@@ -327,7 +386,7 @@ export class Animator {
     this.pitch.step(this.tPitch, omega, dt);
     this.roll.step(this.tRoll, omega * 0.8, dt);
 
-    const ms = MOOD_STYLES[smile ? HAPPY : this.mood];
+    const ms = MOOD_STYLES[this.mood];
     this.lidTop.step(ms[0], 11, dt);
     this.lidSlant.step(ms[1], 11, dt);
     this.lidHappy.step(ms[2], 11, dt);
@@ -338,10 +397,41 @@ export class Animator {
       fx = c.drift * DEG * (Math.sin(t * 0.63 + 0.7) * 0.7 + Math.sin(t * 1.17) * 0.3);
       fy = c.drift * DEG * (Math.sin(t * 0.51) * 0.6 + Math.sin(t * 0.93 + 2.1) * 0.4);
     }
+    // ---- moves: the base pose (where the eyes point, before the slow float) ----
+    this.stepMs(now);
+    const sYaw = this.yaw.value(), sPitch = this.pitch.value();
+    let w = 0, pYaw = sYaw, pPitch = sPitch;
+    const at = (now - this.actStart) >>> 0;
+    if (this.act === ACT.FOLLOW) {
+      this.fol[0].step(this.goalX, FOLLOW_OMEGA * c.gazeSpeed, dt);
+      this.fol[1].step(this.goalY, FOLLOW_OMEGA * c.gazeSpeed, dt);
+      [pYaw, pPitch] = pointToPose(this.fol[0].value(), this.fol[1].value());
+      w = 1;
+    } else if (this.act === ACT.DART) {
+      [pYaw, pPitch] = pointToPose(this.dartDir * DART_X, this.dartY);
+      w = this.dartW;
+      if (at > DART_HOLD_MS + 300 && Math.abs(this.dartW) < 0.002 && Math.abs(this.dartV) < 0.05) { this.act = ACT.NONE; w = 0; }
+    } else if (this.act === ACT.SHAKE) {
+      [pYaw, pPitch] = pointToPose(this.bx, this.by);
+      w = 1;
+    }
+    this.baseYaw = sYaw + (pYaw - sYaw) * w;
+    this.basePitch = sPitch + (pPitch - sPitch) * w;
+    const nX = Math.cos(this.basePitch) * Math.sin(this.baseYaw), nY = -Math.sin(this.basePitch);
+    if (dt > 0) { this.velX = (nX - this.baseX) / dt; this.velY = (nY - this.baseY) / dt; }
+    this.baseX = nX; this.baseY = nY;
+    this.lean.step(clampf(this.velX * 0.025, -0.14, 0.14), 16, dt);
+    this.baseRoll = this.roll.value() + this.lean.x;
+    if (this.act === ACT.SHAKE && this.shakeDone(at)) {
+      this.settle(now, 700, true);
+      if (!this.blinkStart) this.startBlink(now, 2);
+      this.quietUntil = (now + 2500) >>> 0;
+    }
+
     this.br.step(c.faceRadius, 9, dt);
     if (this.br.x < c.faceRadius) { this.br.x = c.faceRadius; if (this.br.v < 0) this.br.v = 0; }
 
-    if (this.autoBlink && this.blinkStart === 0 && reached(now, this.nextBlink)) {
+    if (this.autoBlink && this.blinkStart === 0 && reached(now, this.nextBlink) && reached(now, this.quietUntil)) {
       const twice = this.next() % 100 < 20;
       this.startBlink(now, twice ? 2 : 1);
       this.blinkEvent = true; this.blinkEventTwice = twice;
@@ -379,9 +469,9 @@ export class Animator {
 
     const half = c.screenSize * 0.5, s = this.s;
     s.ballX = half; s.ballY = half; s.ballR = this.br.x;
-    s.yaw = this.yaw.value() + fx;
-    s.pitch = this.pitch.value() + fy + this.moodPitch.value();
-    s.roll = this.roll.value();
+    s.yaw = this.baseYaw + fx;
+    s.pitch = this.basePitch + fy + this.moodPitch.value();
+    s.roll = this.baseRoll;
     s.blink = open;
     s.lidTop = this.lidTop.value();
     s.lidSlant = this.lidSlant.value();
@@ -391,7 +481,17 @@ export class Animator {
     s.bgB = hexColor(this.wiping ? this.toEyes : this.eyes);
     s.wipeX = half; s.wipeY = half;
     s.wipeR = this.wiping ? Math.max(wipeR, 0.001) : 0;
-    s.eye = c.eye;
+    const morph = this.heartK < 0 ? 0 : this.heartK > 1 ? 1 : this.heartK;
+    const pop = this.heartK > 1 ? this.heartK - 1 : 0;
+    let beat = 0;
+    if (this.hearts) {
+      const bt = ((now - this.heartT0) >>> 0) % HEARTBEAT_MS;
+      beat = HEARTBEAT_LUB * bump(bt, 0, 140) + HEARTBEAT_DUB * bump(bt, 200, 140);
+    }
+    s.heart = morph;
+    s.heartSize = 1 + pop * 1.2 + beat * morph;
+    const radius = c.eye.radius * (1 + this.squash);
+    s.eye = { ...c.eye, radius, halfLen: Math.max((c.eye.halfLen + c.eye.radius) * (1 - 0.7 * this.squash) - radius, 0) };
   }
 
   // ---------------- output ----------------
@@ -399,7 +499,6 @@ export class Animator {
   faceColor() { return this.wiping && this.wipeDir > 0 ? this.toFace : this.face; }
   eyeColor() { return this.wiping && this.wipeDir > 0 ? this.toEyes : this.eyes; }
   takeRepaint() { const r = this.repaint; this.repaint = false; return r; }
-  smiling(now) { return this.held || (this.smileEnd !== 0 && ((now - this.smileEnd) | 0) < 0); }
   takeBlinkEvent() {
     if (!this.blinkEvent) return null;
     this.blinkEvent = false;
@@ -431,6 +530,82 @@ export class Animator {
     }
   }
   startBlink(now, count) { this.blinkStart = now ? now >>> 0 : 1; this.blinksLeft = count; }
+
+  // ---- moves ----
+  snext() {
+    let r = this.srng;
+    r ^= r << 13; r >>>= 0;
+    r ^= r >>> 17; r >>>= 0;
+    r ^= r << 5; r >>>= 0;
+    return (this.srng = r);
+  }
+  beginAct(kind, now) {
+    if (this.act !== ACT.NONE) { this.yaw.reset(this.baseYaw); this.pitch.reset(this.basePitch); }
+    this.act = kind; this.actStart = now;
+  }
+  settle(now, restMs, home) {
+    this.yaw.reset(this.baseYaw); this.pitch.reset(this.basePitch);
+    this.tYaw = this.baseYaw; this.tPitch = this.basePitch;
+    this.act = ACT.NONE; this.nextGaze = (now + restMs) >>> 0; this.homeNext = home;
+  }
+  stepMs(now) {
+    let n = (now - this.physT) | 0;
+    if (n <= 0) return;
+    if (n > 100) { this.physT = (now - 100) >>> 0; n = 100; }
+    const sp = Math.sqrt(this.velX * this.velX + this.velY * this.velY);
+    let tgt = 0;
+    if (sp > 0.5) tgt = (Math.abs(this.velX) - Math.abs(this.velY)) / sp * Math.min(sp / 8, 1) * 0.16;
+    for (let i = 0; i < n; i++) {
+      this.physT = (this.physT + 1) >>> 0;
+      const at = (this.physT - this.actStart) | 0;
+      if (this.act === ACT.SHAKE && at >= 0) this.shakeStep(at);
+      {
+        const om = this.hearts ? 16 : 14, z = this.hearts ? 0.42 : 1;
+        const a = -om * om * (this.heartK - (this.hearts ? 1 : 0)) - 2 * z * om * this.heartV;
+        this.heartV += a * 0.001;
+        this.heartK += this.heartV * 0.001;
+      }
+      if (this.act === ACT.DART && at >= 0) {
+        const out = at < DART_HOLD_MS;
+        const om = out ? 24 : 13, z = out ? 0.6 : 1;
+        const a = -om * om * (this.dartW - (out ? 1 : 0)) - 2 * z * om * this.dartV;
+        this.dartV += a * 0.001;
+        this.dartW += this.dartV * 0.001;
+      }
+      const a = -900 * (this.squash - tgt) - 16 * this.squashV;
+      this.squashV += a * 0.001;
+      this.squash = clampf(this.squash + this.squashV * 0.001, -0.35, 0.45);
+    }
+  }
+  shakeStep(t) {
+    if (this.kicks < SHAKE_KICK_MS.length && t >= SHAKE_KICK_MS[this.kicks]) {
+      const ang = (this.snext() % 3600) * (6.2831853 / 3600);
+      this.bvx = this.bvx * 0.4 + Math.cos(ang) * SHAKE_KICK_SPEED[this.kicks];
+      this.bvy = this.bvy * 0.4 + Math.sin(ang) * SHAKE_KICK_SPEED[this.kicks];
+      this.kicks++;
+    }
+    const drag = t < 1500 ? 0.9 : Math.min(0.9 + (t - 1500) * (5 / 700), 6);
+    const k = 1 - drag * 0.001;
+    this.bvx *= k; this.bvy *= k;
+    this.bx += this.bvx * 0.001; this.by += this.bvy * 0.001;
+    const qx = this.bx / REACH_X, qy = this.by / REACH_Y, q = qx * qx + qy * qy;
+    if (q > 1) {
+      const r = 1 / Math.sqrt(q);
+      this.bx *= r; this.by *= r;
+      let nx = this.bx / (REACH_X * REACH_X), ny = this.by / (REACH_Y * REACH_Y);
+      const nl = Math.sqrt(nx * nx + ny * ny);
+      nx /= nl; ny /= nl;
+      const vn = this.bvx * nx + this.bvy * ny;
+      if (vn > 0) {
+        this.bvx -= (1 + SHAKE_BOUNCE) * vn * nx;
+        this.bvy -= (1 + SHAKE_BOUNCE) * vn * ny;
+        this.squashV -= (nx * nx - ny * ny) * vn * 2.5;
+      }
+    }
+  }
+  shakeDone(at) {
+    return at > SHAKE_MAX_MS || (this.kicks >= SHAKE_KICK_MS.length && at > 1200 && this.bvx * this.bvx + this.bvy * this.bvy < 0.0036);
+  }
 }
 
 // ===================================================================== what app.js uses
@@ -459,10 +634,17 @@ export class Engine {
   setAutoBlink(on) { this._call('setAutoBlink', on); }
   setColors(face, eyes) { if (this.started) this.anim.setColors(face, eyes); else { this.cfg.face = face & 0xFFFFFF; this.cfg.eyes = eyes & 0xFFFFFF; } }
   blinkNow(now, twice) { this._start(now); return this.anim.blinkNow(now >>> 0, twice); }
-  touch(down, now) { this._start(now); this.anim.touch(down, now >>> 0); }
+  mirrorBlink(now) { this._start(now); return this.anim.mirrorBlink(now >>> 0); }
+  touch(down, now) { this._start(now); this.anim.touch(down); }
+  follow(x, y, now) { this._start(now); this.anim.follow(x, y, now >>> 0); }
+  followEnd(now) { this._start(now); this.anim.followEnd(now >>> 0); }
+  dart(dir, now) { this._start(now); this.anim.dart(dir, now >>> 0); }
+  shake(seed, now) { this._start(now); this.anim.shake(seed, now >>> 0); }
+  get action() { return this.started ? this.anim.act : ACT.NONE; }
+  setHearts(on, now) { this._start(now); this.anim.setHearts(on, now >>> 0); }
+  get heartsOn() { return this.started && this.anim.hearts; }
   get faceColor() { return this.started ? this.anim.faceColor() : this.cfg.face; }
   get eyeColor() { return this.started ? this.anim.eyeColor() : this.cfg.eyes; }
-  get smilingNow() { return this.started && this.anim.smiling(this.anim.last); }
   get moodName() { return MOODS[this.started ? this.anim.mood : 0]; }
   update(now) {
     this._start(now);

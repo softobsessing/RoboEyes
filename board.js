@@ -11,7 +11,7 @@ export const BLE_PREFIX = 'RoboEyes';
 export const bleName = (id) => `${BLE_PREFIX}-${id}`;
 export const idFromName = (name) => (/^RoboEyes-([0-9A-F]{4})$/i.exec(name || '') || [])[1]?.toUpperCase() || null;
 
-/** First protocol this app speaks (firmware v2: colors, board ID, touch = swap + smile). */
+/** First protocol this app speaks (firmware v2: colors, board ID, touch = color swap). */
 export const PROTOCOL = 2;
 
 /** Web apps for the other boards that use the same ESP32-S3 screen. */
@@ -45,3 +45,29 @@ export function parseColors(line) {
 /** The colors line the app sends: K <face> <eyes>. */
 export const colorsLine = ({ face, eye }) =>
   `K ${(face & 0xFFFFFF).toString(16).padStart(6, '0').toUpperCase()} ${(eye & 0xFFFFFF).toString(16).padStart(6, '0').toUpperCase()}`;
+
+/** First firmware with finger-follow, darts, shake and heart eyes. */
+export const MOVES_FW = 4;
+
+/** "M swap" / "M follow" (the board's touch mode) -> 'swap' | 'follow'; anything else -> null. */
+export const parseMode = (line) => (/^M (swap|follow)$/.exec(String(line).trim()) || [])[1] || null;
+
+/**
+ * A finger the eyes follow (ball radii from the screen center, +x right, +y down):
+ *   "F 12 -40" -> {x: 0.12, y: -0.4};  "F up" -> {up: true};  anything else -> null.
+ */
+export function parseFollow(line) {
+  const s = String(line).trim();
+  if (s === 'F up') return { up: true };
+  const m = /^F (-?\d{1,3}) (-?\d{1,3})$/.exec(s);
+  return m ? { x: Math.max(-100, Math.min(100, +m[1])) / 100, y: Math.max(-100, Math.min(100, +m[2])) / 100 } : null;
+}
+
+/** "H 1" / "H 0" (heart eyes on / off) -> true | false; anything else -> null. */
+export const parseHearts = (line) => { const m = /^H ([01])$/.exec(String(line).trim()); return m ? m[1] === '1' : null; };
+
+/** The line that drags the board's eyes: F <x> <y> (-100..100). */
+export const followLine = (x, y) => {
+  const c = (v) => Math.max(-100, Math.min(100, Math.round(v * 100)));
+  return `F ${c(x)} ${c(y)}`;
+};

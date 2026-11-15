@@ -56,7 +56,12 @@ struct Scene {
   Color bgB, fgB;              // eye / face color inside the wipe circle
   float wipeX, wipeY, wipeR;   // wipe circle; wipeR <= 0 means no wipe
   EyeStyle eye;
+  float heart;                 // 0 = pill eyes, 1 = heart eyes (in between = morphing)
+  float heartSize;             // heart scale (1 = normal; the heartbeat pulses it)
 };
+
+// Heart size in face units per heartSize: 0.30 makes a heart ~0.36 wide (the pill is 0.20).
+static const float HEART_K = 0.30f;
 
 // 565 color, byte-swapped for the panel (it expects big-endian pixels)
 static inline uint16_t pack565(float r, float g, float b) {
@@ -82,6 +87,8 @@ struct Prepared {
   float B, hl;                       // pill radius (half width) and straight half-length this frame
   float topC, topK, topNorm;         // upper lid line: a = topC + topK * outer
   bool  happyOn;
+  bool  heartOn;
+  float heart, heartK;               // morph amount, heart scale (face units)
   float cutA;                        // happy: lower lid rises to here...
   float holeR, holeA;                // ...and a hole opens under the top cap, leaving an arch
   float aMid, openHalf;              // blink closes toward aMid; half-height left open
@@ -126,6 +133,9 @@ static inline void prepare(const Scene &s, Prepared &p) {
   // happy: a lower lid rises to just under the top cap and a hole opens in the
   // cap, so the pill becomes an arch (an upside-down U, like "^ ^")
   p.happyOn = h > 0.001f;
+  p.heart = clamp01(s.heart);
+  p.heartOn = p.heart > 0.001f;
+  p.heartK = HEART_K * s.heartSize;
   p.holeA = -hl + 0.1f * B;
   p.holeR = h * 0.55f * B;
   p.cutA = L + ((-hl + 0.3f * B) - L) * h;
@@ -141,16 +151,19 @@ static inline void prepare(const Scene &s, Prepared &p) {
   p.openHalf = fmaxf(bl * 0.5f * (aBot - aTop), 2.4f / s.ballR);
 
   // Tight screen bounds: trace the rectangle that encloses the visible pill,
-  // project it onto the screen, and take the min/max.
-  const float A0 = fmaxf(-L, p.aMid - p.openHalf), A1 = fminf(L, p.aMid + p.openHalf);
+  // project it onto the screen, and take the min/max. (Mid-morph the eye lies
+  // inside the pill and the heart together, so cover both.)
+  float BB = B, LL = L;
+  if (p.heartOn) { BB = fmaxf(B, 0.61f * p.heartK); LL = fmaxf(L, 0.60f * p.heartK); }
+  const float A0 = fmaxf(-LL, p.aMid - p.openHalf), A1 = fminf(LL, p.aMid + p.openHalf);
   const int K = 6;   // samples per side
   for (int e = 0; e < 2; e++) {
     float side = e == 0 ? -1.f : 1.f, st = p.st * side;
     float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f, zmax = -2.f;
     for (int k = 0; k <= K; k++) {
       float t = (float)k / K;
-      float ta = A0 + (A1 - A0) * t, tb = -B + 2.f * B * t;
-      const float pts[4][2] = { { -B, ta }, { B, ta }, { tb, A0 }, { tb, A1 } };
+      float ta = A0 + (A1 - A0) * t, tb = -BB + 2.f * BB * t;
+      const float pts[4][2] = { { -BB, ta }, { BB, ta }, { tb, A0 }, { tb, A1 } };
       for (int q = 0; q < 4; q++) {
         float b = pts[q][0], a = pts[q][1];
         float fu = b * p.ct + a * st + side * s.eye.spacing;   // pill axes -> face
@@ -181,6 +194,19 @@ static inline Rect eyeRect(const Prepared &p, int e) {
   return { (int)floorf(b.x0), (int)floorf(b.y0), (int)ceilf(b.x1), (int)ceilf(b.y1) };
 }
 
+// Signed distance to a heart (Inigo Quilez's exact heart SDF): tip at (0, 0),
+// lobes on top (+y up), about 1.2 wide and 1.1 tall.
+static inline float sdHeart(float x, float y) {
+  x = fabsf(x);
+  if (y + x > 1.f) {
+    float dx = x - 0.25f, dy = y - 0.75f;
+    return sqrtf(dx * dx + dy * dy) - 0.35355339f;
+  }
+  float ay = y - 1.f, d1 = x * x + ay * ay;
+  float m = 0.5f * fmaxf(x + y, 0.f), bx = x - m, by = y - m, d2 = bx * bx + by * by;
+  return sqrtf(fminf(d1, d2)) * (x > y ? 1.f : -1.f);
+}
+
 // Signed distance (in face units) to one pill eye, including eyelids.
 static inline float pillDist(const Scene &s, const Prepared &p, float fu, float fv, float side) {
   float x = fu - side * s.eye.spacing;
@@ -192,6 +218,11 @@ static inline float pillDist(const Scene &s, const Prepared &p, float fu, float 
   float aa = fabsf(a);
   float ex = aa - p.hl; ex = ex > 0 ? ex : 0;
   float d = sqrtf(b * b + ex * ex) - p.B;                    // the pill itself
+  if (p.heartOn) {                                           // morph toward a heart
+    float k = p.heartK;
+    float dh = sdHeart(b / k, 0.52f - a / k) * k;            // centered on the eye, tip down
+    d += (dh - d) * p.heart;
+  }
   float outer = b * side;                                    // + toward the outer corner
   float top = (p.topC + p.topK * outer - a) * p.topNorm;     // mood: upper lid
   if (top > d) d = top;

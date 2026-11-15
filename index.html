@@ -13,7 +13,7 @@
       <span class="logo" aria-hidden="true"><i></i><i></i></span>
       <div>
         <h1>RoboEyes</h1>
-        <p class="tagline">a round little face that smiles when you touch it</p>
+        <p class="tagline">a round little face you can poke, drag around and shake</p>
       </div>
     </div>
     <div class="conn">
@@ -27,17 +27,38 @@
   <div id="linkMsg" class="link-msg" role="status" hidden></div>
 
   <main>
+    <div class="col">
     <section class="card stage" aria-label="RoboEyes' screen">
-      <button id="btnTap" type="button" class="visor" title="Touch the face" aria-label="Touch the face: swap the colors and smile">
+      <button id="btnTap" type="button" class="visor" title="Touch the face" aria-label="Touch the face: swap the colors">
         <canvas id="screen" width="466" height="466" aria-hidden="true"></canvas>
       </button>
       <div class="feels">
-        <div id="mood" class="mood" data-smile="false">just looking around</div>
-        <div id="moodSub" class="mood-sub">Click the face to try a touch.</div>
+        <div id="mood" class="mood">just looking around</div>
+        <div id="moodSub" class="mood-sub">Click the face to try a touch: the colors swap.</div>
       </div>
       <p class="stage-note">Live preview, drawn with the same eye code as the board. It glances around on its own, so the exact gaze can differ from your board.</p>
     </section>
 
+    <section class="card moves" aria-label="Touch and moves">
+      <h2>Touch &amp; moves</h2>
+      <div class="field-label">When you touch the screen</div>
+      <div class="seg" id="touchMode" role="group" aria-label="What touching the screen does">
+        <button type="button" data-mode="swap" aria-pressed="true">Swap colors</button>
+        <button type="button" data-mode="follow" aria-pressed="false">Eyes follow your finger</button>
+      </div>
+      <p id="touchNote" class="fine"></p>
+      <div class="field-label moves-label">Moves</div>
+      <div class="move-btns">
+        <button id="btnDartL" type="button" title="Shortcut: ← key">← Dart left</button>
+        <button id="btnShake" type="button" class="primary" title="Shortcut: S key">Shake it</button>
+        <button id="btnDartR" type="button" title="Shortcut: → key">Dart right →</button>
+      </div>
+      <button id="btnHearts" type="button" class="hearts-btn" aria-pressed="false" title="Shortcut: H key"><span aria-hidden="true">♥</span> Heart eyes</button>
+      <p id="movesNote" class="fine"></p>
+    </section>
+    </div>
+
+    <div class="side">
     <section class="card board" aria-label="Your board">
       <h2>Your board</h2>
       <div class="board-card" id="boardCard" data-live="false">
@@ -48,7 +69,7 @@
         </div>
       </div>
       <ol class="steps">
-        <li><b>Touch the board:</b> the face and eye colors swap and the eyes smile. The smile lasts while your finger is down plus 2.5 s, then the usual eyes come back with the swapped colors.</li>
+        <li><b>Touch the board:</b> the face and eye colors swap (touch again to swap back), or the eyes follow your finger. Pick which under <b>Touch &amp; moves</b>.</li>
         <li><b>Pick colors below:</b> the board changes as you drag and remembers them, even after it's switched off.</li>
         <li><b>Save the ones you like</b> to switch back with one click.</li>
       </ol>
@@ -56,6 +77,30 @@
         An EyeBuddy board uses the <a href="https://softobsessing.github.io/doomscroll-eyes/">doomscroll-eyes app</a>.
         Use desktop Chrome or Edge: they can talk to USB and Bluetooth.</p>
     </section>
+
+    <section class="card blink" aria-label="Blink with me">
+      <div class="blink-head">
+        <h2>Blink with me</h2>
+        <button id="btnCam" type="button" class="primary">Turn on camera</button>
+      </div>
+      <p class="fine blink-intro">RoboEyes blinks when you blink. The camera picture stays on this computer: nothing is uploaded.</p>
+      <div id="camBox" class="cam" hidden>
+        <video id="video" playsinline muted aria-label="Your camera (mirrored)"></video>
+        <span id="blinkFlash" class="blink-flash" aria-hidden="true">blink</span>
+        <span id="camMsg" class="cam-msg"></span>
+      </div>
+      <div class="meter-wrap" id="meterWrap" hidden>
+        <div class="field-label">eyes closed</div>
+        <div class="meter" title="How closed your eyes look. Crossing the line = a blink."><div id="meterFill" class="meter-fill"></div><i id="meterLine" class="meter-line"></i></div>
+      </div>
+      <label class="sens">
+        <span class="field-label">Sensitivity <b id="sensLabel">extra sensitive</b></span>
+        <input id="sens" type="range" min="0" max="100" step="1">
+        <span class="sens-ends"><span>only big blinks</span><span>every tiny blink</span></span>
+      </label>
+      <p id="blinkStats" class="fine">Camera off.</p>
+    </section>
+    </div>
 
     <section class="card colors" aria-label="Colors">
       <h2>Colors</h2>
